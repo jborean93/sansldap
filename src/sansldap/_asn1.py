@@ -8,30 +8,6 @@ import struct
 import typing as t
 
 
-class ASN1Value(t.NamedTuple):
-    """A representation of an ASN.1 TLV as a tuple.
-
-    Defines the ASN.1 Type Length Value (TLV) values as separate objects for
-    easier parsing. This is returned by :method:`unpack_asn1`.
-
-    Attributes:
-        tag_class (TagClass): The tag class of the TLV.
-        constructed (bool): Whether the value is constructed or 0, 1, or more
-            element encodings (True) or not (False).
-        tag_number (int): The tag number of the value, can be a TypeTagNumber
-            if the tag_class is `universal` otherwise it's an explicit tag
-            number value.
-        tag_length (int): The length of the encoded tag.
-        length (int): The length of the value the tag represents.
-    """
-
-    tag_class: TagClass
-    constructed: bool
-    tag_number: int
-    tag_length: int
-    length: int
-
-
 class TagClass(enum.IntEnum):
     UNIVERSAL = 0
     APPLICATION = 1
@@ -79,6 +55,244 @@ class TypeTagNumber(enum.IntEnum):
     DURATION = 34
     OID_IRL = 35
     RELATIVE_OID_IRL = 36
+
+
+class ASN1Tag(t.NamedTuple):
+    tag_class: TagClass
+    tag_number: t.Union[int, TypeTagNumber]
+    is_constructed: bool
+
+    @classmethod
+    def universal_tag(
+        cls,
+        number: TypeTagNumber,
+        is_constructed: bool = False,
+    ) -> ASN1Tag:
+        return ASN1Tag(
+            tag_class=TagClass.UNIVERSAL,
+            tag_number=number,
+            is_constructed=is_constructed,
+        )
+
+
+class ASN1Value(t.NamedTuple):
+    """A representation of an ASN.1 TLV as a tuple.
+
+    Defines the ASN.1 Type Length Value (TLV) values as separate objects for
+    easier parsing. This is returned by :method:`unpack_asn1`.
+
+    Attributes:
+        tag (ASN1Tag): The tag
+        tag_class (TagClass): The tag class of the TLV.
+        constructed (bool): Whether the value is constructed or 0, 1, or more
+            element encodings (True) or not (False).
+        tag_number (int): The tag number of the value, can be a TypeTagNumber
+            if the tag_class is `universal` otherwise it's an explicit tag
+            number value.
+        tag_length (int): The length of the encoded tag.
+        length (int): The length of the value the tag represents.
+    """
+
+    tag: ASN1Tag
+    tag_length: int
+    length: int
+
+
+def read_asn1_header(
+    data: t.Union[bytes, bytearray, memoryview],
+) -> ASN1Value:
+    """Reads the ASN.1 Tag and Length octets
+
+    Reads the raw ASN.1 value to retrieve the tag and length values.
+
+    Args:
+      data: The raw bytes to read.
+
+    Returns:
+        ASN1Value: A tuple containing the tag and length information.
+    """
+    view = memoryview(data)
+
+    octet1 = struct.unpack("B", view[:1])[0]
+    tag_class = TagClass((octet1 & 0b11000000) >> 6)
+    constructed = bool(octet1 & 0b00100000)
+    tag_number = octet1 & 0b00011111
+
+    tag_octets = 1
+    if tag_number == 31:
+        tag_number, octet_count = _unpack_asn1_octet_number(view[1:])
+        tag_octets += octet_count
+
+    if tag_class == TagClass.UNIVERSAL:
+        tag_number = TypeTagNumber(tag_number)
+
+    view = view[tag_octets:]
+
+    length = struct.unpack("B", view[:1])[0]
+    length_octets = 1
+
+    if length == 0b1000000:
+        # Indefinite length, the length is not known and will be marked by two
+        # NULL octets known as end-of-content octets later in the stream.
+        length = -1
+
+    elif length & 0b10000000:
+        # If the MSB is set then the length octet just contains the number of
+        # octets that encodes the actual length.
+        length_octets += length & 0b01111111
+        length = 0
+
+        for idx in range(1, length_octets):
+            octet_val = struct.unpack("B", view[idx : idx + 1])[0]
+            length += octet_val << (8 * (length_octets - 1 - idx))
+
+    return ASN1Value(
+        tag=ASN1Tag(
+            tag_class=tag_class,
+            tag_number=tag_number,
+            is_constructed=constructed,
+        ),
+        tag_length=tag_octets + length_octets,
+        length=length,
+    )
+
+
+def read_asn1_enumerated(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[int, int]:
+    """Unpacks an ASN.1 ENUMERATED value."""
+    if not tag:
+        tag = ASN1Tag.universal_tag(TypeTagNumber.ENUMERATED, False)
+    return read_asn1_integer(data, tag, hint=hint)
+
+
+def read_asn1_integer(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[int, int]:
+    """Unpacks an ASN.1 INTEGER value."""
+    if not tag:
+        tag = ASN1Tag.universal_tag(TypeTagNumber.INTEGER, False)
+
+    raw_int, consumed = _validate_tag(data, tag, hint=hint)
+    b_int = bytearray(raw_int)
+
+    is_negative = b_int[0] & 0b10000000
+    if is_negative:
+        # Get the two's compliment.
+        for i in range(len(b_int)):
+            b_int[i] = 0xFF - b_int[i]
+
+        for i in range(len(b_int) - 1, -1, -1):
+            if b_int[i] == 0xFF:
+                b_int[i - 1] += 1
+                b_int[i] = 0
+                break
+
+            else:
+                b_int[i] += 1
+                break
+
+    int_value = 0
+    for val in b_int:
+        int_value = (int_value << 8) | val
+
+    if is_negative:
+        int_value *= -1
+
+    return int_value, consumed
+
+
+def read_asn1_octet_string(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[memoryview, int]:
+    """Unpacks an ASN.1 OCTET_STRING value."""
+    if not tag:
+        tag = ASN1Tag.universal_tag(TypeTagNumber.OCTET_STRING, False)
+
+    return _validate_tag(data, tag, hint=hint)
+
+
+def read_asn1_sequence(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[memoryview, int]:
+    """Unpacks an ASN.1 SEQUENCE value."""
+    if not tag:
+        tag = ASN1Tag.universal_tag(TypeTagNumber.SEQUENCE, True)
+
+    return _validate_tag(data, tag, hint=hint)
+
+
+def _validate_tag(
+    data: t.Union[bytes, bytearray, memoryview],
+    expected_tag: ASN1Tag,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[memoryview, int]:
+    view = memoryview(data)
+
+    actual_tag, tag_length, data_length = read_asn1_header(view)
+    hint_str = f" for {hint}" if hint else ""
+
+    if actual_tag != expected_tag:
+        raise ValueError(f"Expected tag {expected_tag}{hint_str} but got {actual_tag}")
+
+    view = view[tag_length:]
+    if data_length == -1:
+        raise NotImplementedError("Indefinite length not implemented yet")
+
+    if len(view) < data_length:
+        raise ValueError(f"Not enough data{hint_str}: expecting {data_length} but got {len(view)}")
+
+    return view[:data_length], tag_length + data_length
+
+
+def _pack_asn1_octet_number(
+    num: int,
+) -> bytes:
+    """Packs an int number into an ASN.1 integer value that spans multiple octets."""
+    num_octets = bytearray()
+
+    while num:
+        # Get the 7 bit value of the number.
+        octet_value = num & 0b01111111
+
+        # Set the MSB if this isn't the first octet we are processing (overall last octet)
+        if len(num_octets):
+            octet_value |= 0b10000000
+
+        num_octets.append(octet_value)
+
+        # Shift the number by 7 bits as we've just processed them.
+        num >>= 7
+
+    # Finally we reverse the order so the higher octets are first.
+    num_octets.reverse()
+
+    return num_octets
+
+
+def _unpack_asn1_octet_number(
+    data: memoryview,
+) -> t.Tuple[int, int]:
+    """Unpacks an ASN.1 INTEGER value that can span across multiple octets."""
+    i = 0
+    idx = 0
+    while True:
+        element = struct.unpack("B", data[idx : idx + 1])[0]
+        idx += 1
+
+        i = (i << 7) + (element & 0b01111111)
+        if not element & 0b10000000:
+            break
+
+    return i, idx  # int value and the number of octets used.
 
 
 def pack_asn1(
@@ -158,119 +372,6 @@ def pack_asn1(
         b_asn1_data.extend(length_octets)
 
     return bytes(b_asn1_data) + bytes(data)
-
-
-def unpack_asn1(
-    data: t.Union[bytes, bytearray, memoryview],
-) -> ASN1Value:
-    """Unpacks an ASN.1 TLV into each element.
-
-    Unpacks the raw ASN.1 value into a `ASN1Value` tuple and returns the
-    remaining bytes that are not part of the ASN.1 TLV.
-
-    Args:
-        data: The raw bytes to unpack as an ASN.1 TLV.
-
-    Returns:
-        ASN1Value: The ASN.1 value that is unpacked from the raw bytes passed
-            in.
-    """
-    view = memoryview(data)
-
-    octet1 = struct.unpack("B", view[:1])[0]
-    tag_class = TagClass((octet1 & 0b11000000) >> 6)
-    constructed = bool(octet1 & 0b00100000)
-    tag_number = octet1 & 0b00011111
-
-    length_offset = 1
-    if tag_number == 31:
-        tag_number, octet_count = _unpack_asn1_octet_number(view[1:])
-        length_offset += octet_count
-
-    if tag_class == TagClass.UNIVERSAL:
-        tag_number = TypeTagNumber(tag_number)
-
-    view = view[length_offset:]
-
-    length = struct.unpack("B", view[:1])[0]
-    length_octets = 1
-
-    if length & 0b10000000:
-        # If the MSB is set then the length octet just contains the number of octets that encodes the actual length.
-        length_octets += length & 0b01111111
-        length = 0
-
-        for idx in range(1, length_octets):
-            octet_val = struct.unpack("B", view[idx : idx + 1])[0]
-            length += octet_val << (8 * (length_octets - 1 - idx))
-
-    return ASN1Value(
-        tag_class=tag_class,
-        constructed=constructed,
-        tag_number=tag_number,
-        tag_length=length_octets,
-        length=length,
-    )
-
-
-def _pack_asn1_octet_number(
-    num: int,
-) -> bytes:
-    """Packs an int number into an ASN.1 integer value that spans multiple octets."""
-    num_octets = bytearray()
-
-    while num:
-        # Get the 7 bit value of the number.
-        octet_value = num & 0b01111111
-
-        # Set the MSB if this isn't the first octet we are processing (overall last octet)
-        if len(num_octets):
-            octet_value |= 0b10000000
-
-        num_octets.append(octet_value)
-
-        # Shift the number by 7 bits as we've just processed them.
-        num >>= 7
-
-    # Finally we reverse the order so the higher octets are first.
-    num_octets.reverse()
-
-    return num_octets
-
-
-def _unpack_asn1_octet_number(
-    data: t.Union[bytes, bytearray, memoryview],
-) -> t.Tuple[int, int]:
-    """Unpacks an ASN.1 INTEGER value that can span across multiple octets."""
-    i = 0
-    idx = 0
-    while True:
-        element = struct.unpack("B", data[idx : idx + 1])[0]
-        idx += 1
-
-        i = (i << 7) + (element & 0b01111111)
-        if not element & 0b10000000:
-            break
-
-    return i, idx  # int value and the number of octets used.
-
-
-class ASN1Tag(t.NamedTuple):
-    tag_class: TagClass
-    tag_number: t.Union[int, TypeTagNumber]
-    is_constructed: bool
-
-    @classmethod
-    def universal_tag(
-        cls,
-        number: TypeTagNumber,
-        is_constructed: bool = False,
-    ) -> ASN1Tag:
-        return ASN1Tag(
-            tag_class=TagClass.UNIVERSAL,
-            tag_number=number,
-            is_constructed=is_constructed,
-        )
 
 
 class ASN1Writer:
@@ -518,13 +619,6 @@ class ASN1Sequence:
 #     return b_data != b"\x00"
 
 
-# def unpack_asn1_enumerated(value: t.Union[ASN1Value, bytes]) -> int:
-#     """Unpacks an ASN.1 ENUMERATED value."""
-#     b_data = extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.enumerated)
-
-#     return unpack_asn1_integer(b_data)
-
-
 # def unpack_asn1_general_string(value: t.Union[ASN1Value, bytes]) -> bytes:
 #     """Unpacks an ASN.1 GeneralString value."""
 #     return extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.general_string)
@@ -552,36 +646,6 @@ class ASN1Sequence:
 #         raise err  # type: ignore
 
 
-# def unpack_asn1_integer(value: t.Union[ASN1Value, bytes]) -> int:
-#     """Unpacks an ASN.1 INTEGER value."""
-#     b_int = bytearray(extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.INTEGER))
-
-#     is_negative = b_int[0] & 0b10000000
-#     if is_negative:
-#         # Get the two's compliment.
-#         for i in range(len(b_int)):
-#             b_int[i] = 0xFF - b_int[i]
-
-#         for i in range(len(b_int) - 1, -1, -1):
-#             if b_int[i] == 0xFF:
-#                 b_int[i - 1] += 1
-#                 b_int[i] = 0
-#                 break
-
-#             else:
-#                 b_int[i] += 1
-#                 break
-
-#     int_value = 0
-#     for val in b_int:
-#         int_value = (int_value << 8) | val
-
-#     if is_negative:
-#         int_value *= -1
-
-#     return int_value
-
-
 # def unpack_asn1_object_identifier(value: t.Union[ASN1Value, bytes]) -> str:
 #     """Unpacks an ASN.1 OBJECT IDENTIFIER value."""
 #     b_data = extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.object_identifier)
@@ -597,23 +661,6 @@ class ASN1Sequence:
 #         idx += octet_len
 
 #     return ".".join([str(i) for i in ids])
-
-
-# def unpack_asn1_octet_string(value: t.Union[ASN1Value, bytes]) -> bytes:
-#     """Unpacks an ASN.1 OCTET STRING value."""
-#     return extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.OCTET_STRING)
-
-
-# def unpack_asn1_sequence(value: t.Union[ASN1Value, bytes]) -> t.List[ASN1Value]:
-#     """Unpacks an ASN.1 SEQUENCE value."""
-#     b_data = extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.sequence)
-
-#     values = []
-#     while b_data:
-#         v, b_data = unpack_asn1(b_data)
-#         values.append(v)
-
-#     return values
 
 
 # def unpack_asn1_tagged_sequence(value: t.Union[ASN1Value, bytes]) -> t.Dict[int, ASN1Value]:
