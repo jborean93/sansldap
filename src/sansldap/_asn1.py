@@ -75,7 +75,7 @@ class ASN1Tag(t.NamedTuple):
         )
 
 
-class ASN1Value(t.NamedTuple):
+class ASN1Header(t.NamedTuple):
     """A representation of an ASN.1 TLV as a tuple.
 
     Defines the ASN.1 Type Length Value (TLV) values as separate objects for
@@ -100,7 +100,7 @@ class ASN1Value(t.NamedTuple):
 
 def read_asn1_header(
     data: t.Union[bytes, bytearray, memoryview],
-) -> ASN1Value:
+) -> ASN1Header:
     """Reads the ASN.1 Tag and Length octets
 
     Reads the raw ASN.1 value to retrieve the tag and length values.
@@ -146,7 +146,7 @@ def read_asn1_header(
             octet_val = struct.unpack("B", view[idx : idx + 1])[0]
             length += octet_val << (8 * (length_octets - 1 - idx))
 
-    return ASN1Value(
+    return ASN1Header(
         tag=ASN1Tag(
             tag_class=tag_class,
             tag_number=tag_number,
@@ -157,27 +157,44 @@ def read_asn1_header(
     )
 
 
+def read_asn1_boolean(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[bool, int]:
+    """Unpacks an ASN.1 BOOLEAN value."""
+    if not tag:
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.BOOLEAN, False)
+
+    raw_bool, consumed = _validate_tag(data, tag, header=header, hint=hint)
+
+    return raw_bool.tobytes() != b"\x00", consumed
+
+
 def read_asn1_enumerated(
     data: t.Union[bytes, bytearray, memoryview],
     tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
     hint: t.Optional[str] = None,
 ) -> t.Tuple[int, int]:
     """Unpacks an ASN.1 ENUMERATED value."""
     if not tag:
-        tag = ASN1Tag.universal_tag(TypeTagNumber.ENUMERATED, False)
-    return read_asn1_integer(data, tag, hint=hint)
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.ENUMERATED, False)
+    return read_asn1_integer(data, tag, header=header, hint=hint)
 
 
 def read_asn1_integer(
     data: t.Union[bytes, bytearray, memoryview],
     tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
     hint: t.Optional[str] = None,
 ) -> t.Tuple[int, int]:
     """Unpacks an ASN.1 INTEGER value."""
     if not tag:
-        tag = ASN1Tag.universal_tag(TypeTagNumber.INTEGER, False)
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.INTEGER, False)
 
-    raw_int, consumed = _validate_tag(data, tag, hint=hint)
+    raw_int, consumed = _validate_tag(data, tag, header=header, hint=hint)
     b_int = bytearray(raw_int)
 
     is_negative = b_int[0] & 0b10000000
@@ -209,35 +226,55 @@ def read_asn1_integer(
 def read_asn1_octet_string(
     data: t.Union[bytes, bytearray, memoryview],
     tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
     hint: t.Optional[str] = None,
 ) -> t.Tuple[memoryview, int]:
     """Unpacks an ASN.1 OCTET_STRING value."""
     if not tag:
-        tag = ASN1Tag.universal_tag(TypeTagNumber.OCTET_STRING, False)
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.OCTET_STRING, False)
 
-    return _validate_tag(data, tag, hint=hint)
+    return _validate_tag(data, tag, header=header, hint=hint)
 
 
 def read_asn1_sequence(
     data: t.Union[bytes, bytearray, memoryview],
     tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
     hint: t.Optional[str] = None,
 ) -> t.Tuple[memoryview, int]:
     """Unpacks an ASN.1 SEQUENCE value."""
     if not tag:
-        tag = ASN1Tag.universal_tag(TypeTagNumber.SEQUENCE, True)
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.SEQUENCE, True)
 
-    return _validate_tag(data, tag, hint=hint)
+    return _validate_tag(data, tag, header=header, hint=hint)
+
+
+def read_asn1_set(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[memoryview, int]:
+    """Unpacks an ASN.1 SET value."""
+    if not tag:
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.SET, True)
+
+    return _validate_tag(data, tag, header=header, hint=hint)
 
 
 def _validate_tag(
     data: t.Union[bytes, bytearray, memoryview],
     expected_tag: ASN1Tag,
+    header: t.Optional[ASN1Header] = None,
     hint: t.Optional[str] = None,
 ) -> t.Tuple[memoryview, int]:
     view = memoryview(data)
 
-    actual_tag, tag_length, data_length = read_asn1_header(view)
+    if header:
+        actual_tag, tag_length, data_length = header
+    else:
+        actual_tag, tag_length, data_length = read_asn1_header(view)
+
     hint_str = f" for {hint}" if hint else ""
 
     if actual_tag != expected_tag:
@@ -610,13 +647,6 @@ class ASN1Sequence:
 #     last_octet = (last_octet >> unused_bits) << unused_bits
 
 #     return b_data[1:-1] + struct.pack("B", last_octet)
-
-
-# def unpack_asn1_boolean(value: t.Union[ASN1Value, bytes]) -> bool:
-#     """Unpacks an ASN.1 BOOLEAN value."""
-#     b_data = extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.BOOLEAN)
-
-#     return b_data != b"\x00"
 
 
 # def unpack_asn1_general_string(value: t.Union[ASN1Value, bytes]) -> bytes:

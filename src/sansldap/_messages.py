@@ -14,6 +14,7 @@ from ._asn1 import (
     TagClass,
     TypeTagNumber,
     pack_asn1,
+    read_asn1_boolean,
     read_asn1_enumerated,
     read_asn1_header,
     read_asn1_integer,
@@ -21,6 +22,7 @@ from ._asn1 import (
     read_asn1_sequence,
 )
 from ._controls import LDAPControl
+from ._filter import LDAPFilter
 
 
 class DereferencingPolicy(enum.IntEnum):
@@ -80,6 +82,48 @@ class SearchScope(enum.IntEnum):
 
 @dataclasses.dataclass
 class LDAPMessage:
+    """The base LDAP Message object.
+
+    This is the base object used for all LDAP messages.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls
+
+    Attributes:
+        tag_number: The protocolOp choice for this message type.
+
+
+    LDAPMessage ::= SEQUENCE {
+            messageID       MessageID,
+            protocolOp      CHOICE {
+                bindRequest           BindRequest,
+                bindResponse          BindResponse,
+                unbindRequest         UnbindRequest,
+                searchRequest         SearchRequest,
+                searchResEntry        SearchResultEntry,
+                searchResDone         SearchResultDone,
+                searchResRef          SearchResultReference,
+                modifyRequest         ModifyRequest,
+                modifyResponse        ModifyResponse,
+                addRequest            AddRequest,
+                addResponse           AddResponse,
+                delRequest            DelRequest,
+                delResponse           DelResponse,
+                modDNRequest          ModifyDNRequest,
+                modDNResponse         ModifyDNResponse,
+                compareRequest        CompareRequest,
+                compareResponse       CompareResponse,
+                abandonRequest        AbandonRequest,
+                extendedReq           ExtendedRequest,
+                extendedResp          ExtendedResponse,
+                ...,
+                intermediateResponse  IntermediateResponse },
+            controls       [0] Controls OPTIONAL }
+
+    https://datatracker.ietf.org/doc/html/rfc4511#section-4.1.1
+    """
+
     tag_number: int = dataclasses.field(init=False, default=0)
 
     message_id: int
@@ -106,17 +150,18 @@ class LDAPMessage:
         )
         sequence_view = sequence_view[consumed:]
 
-        protocol_op_tag = read_asn1_header(sequence_view)[0]
+        protocol_op_header = read_asn1_header(sequence_view)
+        protocol_op_tag = protocol_op_header.tag
         if protocol_op_tag.tag_class != TagClass.APPLICATION:
-            raise ValueError(f"Expecting LDAPMessage protocolOp to be an APPLICATION but got {protocol_op_tag}")
+            raise ValueError(f"Expecting LDAPMessage.protocolOp to be an APPLICATION but got {protocol_op_tag}")
 
         unpack_func = PROTOCOL_UNPACKER.get(protocol_op_tag.tag_number, None)
         if not unpack_func:
-            raise NotImplementedError(f"Unknown LDAPMessage protocolOp choice {protocol_op_tag.tag_number}")
+            raise NotImplementedError(f"Unknown LDAPMessage.protocolOp choice {protocol_op_tag.tag_number}")
 
         msg_sequence, consumed = read_asn1_sequence(
             sequence_view,
-            tag=protocol_op_tag,
+            header=protocol_op_header,
             hint="LDAPMessage.protocolOp",
         )
         sequence_view = sequence_view[consumed:]
@@ -124,36 +169,34 @@ class LDAPMessage:
         controls: t.List[LDAPControl] = []
         response_name: t.Optional[str] = None
         while sequence_view:
-            next_tag = read_asn1_header(sequence_view)[0]
+            next_header = read_asn1_header(sequence_view)
 
-            tag_consumed = None
+            if next_header.tag.tag_class == TagClass.CONTEXT_SPECIFIC:
+                if next_header.tag.tag_number == 0:
+                    controls_view = read_asn1_sequence(
+                        sequence_view,
+                        header=next_header,
+                        hint="LDAPMessage.controls",
+                    )[0]
+                    while controls_view:
+                        control, control_consumed = LDAPControl.unpack(controls_view)
+                        controls_view = controls_view[control_consumed:]
+                        controls.append(control)
 
-            if next_tag.tag_class == TagClass.CONTEXT_SPECIFIC:
-                if next_tag.tag_number == 0:
-                    control, tag_consumed = LDAPControl.unpack(sequence_view)
-                    controls.append(control)
-
-                elif next_tag.tag_number == 10:
+                elif next_header.tag.tag_number == 10:
                     # Defined in MS-ADTS - NoticeOfDisconnectionLDAPMessage.
                     # This is an extension of LDAPMessage in the RFC but AD
                     # replies with this on critical failures where it has torn
                     # down the connection.
                     # responseName    [10] LDAPOID
-                    b_response_name, tag_consumed = read_asn1_octet_string(
-                        sequence_view, tag=next_tag, hint="LDAPMessage.responseName"
-                    )
+                    b_response_name = read_asn1_octet_string(
+                        sequence_view,
+                        header=next_header,
+                        hint="LDAPMessage.responseName",
+                    )[0]
                     response_name = b_response_name.tobytes().decode("utf-8")
 
-            if not tag_consumed:
-                # Received something we don't know (or care about), just
-                # continue iterating the sequence.
-                _, tag_consumed = read_asn1_octet_string(
-                    sequence_view,
-                    tag=next_tag,
-                    hint="LDAPMessage.controls",
-                )
-
-            sequence_view = sequence_view[tag_consumed:]
+            sequence_view = sequence_view[next_header.tag_length + next_header.length :]
 
         msg = unpack_func(msg_sequence, message_id, controls)
 
@@ -323,22 +366,16 @@ def _unpack_bind_response(
 
     sasl_creds: t.Optional[bytes] = None
     while view:
-        next_tag = read_asn1_header(view)[0]
-        if next_tag.tag_class == TagClass.CONTEXT_SPECIFIC and next_tag.tag_number == 7:
+        header = read_asn1_header(view)
+        if header.tag.tag_class == TagClass.CONTEXT_SPECIFIC and header.tag.tag_number == 7:
             sasl_creds = read_asn1_octet_string(
                 view,
-                tag=next_tag,
+                header=header,
                 hint="BindResponse.serverSaslCreds",
             )[0].tobytes()
             break
 
-        else:
-            _, consumed = read_asn1_octet_string(
-                view,
-                tag=next_tag,
-                hint="BindResponse",
-            )
-            view = view[consumed:]
+        view = view[header.tag_length + header.length :]
 
     return BindResponse(
         message_id=message_id,
@@ -363,7 +400,59 @@ class SearchRequest(LDAPMessage):
     size_limit: int
     time_limit: int
     types_only: bool
-    filter: bytes
+    filter: LDAPFilter
+    attributes: t.List[str]
+
+
+def _unpack_search_request(
+    view: memoryview,
+    message_id: int,
+    controls: t.List[LDAPControl],
+) -> SearchRequest:
+    base_object, consumed = read_asn1_octet_string(view, hint="SearchRequest.baseObject")
+    view = view[consumed:]
+
+    scope, consumed = read_asn1_enumerated(view, hint="SearchRequest.scope")
+    view = view[consumed:]
+
+    deref_aliases, consumed = read_asn1_enumerated(view, hint="SearchRequest.derefAliases")
+    view = view[consumed:]
+
+    size_limit, consumed = read_asn1_integer(view, hint="SearchRequest.sizeLimt")
+    view = view[consumed:]
+
+    time_limit, consumed = read_asn1_integer(view, hint="SearchRequest.timeLimit")
+    view = view[consumed:]
+
+    types_only, consumed = read_asn1_boolean(view, hint="SearchRequest.typesOnly")
+    view = view[consumed:]
+
+    ldap_filter, consumed = LDAPFilter.unpack(view)
+    view = view[consumed:]
+
+    attributes_view = read_asn1_sequence(view, hint="SearchRequest.attributes")[0]
+    attributes: t.List[str] = []
+    while attributes_view:
+        attr_value, consumed = read_asn1_octet_string(
+            attributes_view,
+            hint="SearchRequest.attributes.value",
+        )
+        attributes_view = attributes_view[consumed:]
+
+        attributes.append(attr_value.tobytes().decode("utf-8"))
+
+    return SearchRequest(
+        message_id=message_id,
+        controls=controls,
+        base_object=base_object.tobytes().decode("utf-8"),
+        scope=SearchScope(scope),
+        deref_aliases=DereferencingPolicy(deref_aliases),
+        size_limit=size_limit,
+        time_limit=time_limit,
+        types_only=types_only,
+        filter=ldap_filter,
+        attributes=attributes,
+    )
 
 
 @dataclasses.dataclass
@@ -486,4 +575,5 @@ BIND_REQUEST_UNPACKER: t.Dict[
 PROTOCOL_UNPACKER: t.Dict[int, t.Callable[[memoryview, int, t.List[LDAPControl]], LDAPMessage]] = {
     BindRequest.tag_number: _unpack_bind_request,
     BindResponse.tag_number: _unpack_bind_response,
+    SearchRequest.tag_number: _unpack_search_request,
 }
