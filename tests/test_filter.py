@@ -2,6 +2,9 @@
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
 import base64
+import typing as t
+
+import pytest
 
 import sansldap._filter as f
 
@@ -82,3 +85,115 @@ def test_filter_not_unpack() -> None:
     assert isinstance(actual.filter.filter, f.FilterEquality)
     assert actual.filter.filter.attribute == "foo"
     assert actual.filter.filter.value == b"bar"
+
+
+def test_filter_equality_unpack() -> None:
+    data = base64.b64decode("oyUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+
+    assert consumed == len(data)
+    assert isinstance(actual, f.FilterEquality)
+    assert actual.attribute == "objectClass;test"
+    assert actual.value == "abc def ☺ café".encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "attribute, initial, any_values, final, data",
+    [
+        (
+            "objectClass;test",
+            None,
+            ["abc ", "def ☺ ", "café"],
+            None,
+            "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4EEYWJjIIEIZGVmIOKYuiCBBWNhZsOp",
+        ),
+        (
+            "objectClass;test",
+            "abc ",
+            ["def ☺ ", "café"],
+            None,
+            "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4AEYWJjIIEIZGVmIOKYuiCBBWNhZsOp",
+        ),
+        (
+            "objectClass;test",
+            None,
+            ["abc ", "def ☺ "],
+            "café",
+            "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4EEYWJjIIEIZGVmIOKYuiCCBWNhZsOp",
+        ),
+        (
+            "objectClass;test",
+            "abc ",
+            ["def ☺ "],
+            "café",
+            "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4AEYWJjIIEIZGVmIOKYuiCCBWNhZsOp",
+        ),
+    ],
+    ids=[
+        "no_initial_and_no_final",
+        "initial_and_no_final",
+        "no_initial_and_final",
+        "initial_and_final",
+    ],
+)
+def test_filter_substrings_unpack(
+    attribute: str,
+    initial: t.Optional[str],
+    any_values: t.List[str],
+    final: t.Optional[str],
+    data: str,
+) -> None:
+    b_data = base64.b64decode(data)
+    actual, consumed = f.LDAPFilter.unpack(memoryview(b_data))
+
+    assert consumed == len(b_data)
+    assert isinstance(actual, f.FilterSubstrings)
+    assert actual.attribute == attribute
+    assert actual.initial == (initial.encode("utf-8") if initial else None)
+    assert actual.any == [a.encode("utf-8") for a in any_values]
+    assert actual.final == (final.encode("utf-8") if final else None)
+
+
+def test_filter_greater_or_equal_unpack() -> None:
+    data = base64.b64decode("pSUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+
+    assert consumed == len(data)
+    assert isinstance(actual, f.FilterGreaterOrEqual)
+    assert actual.attribute == "objectClass;test"
+    assert actual.value == "abc def ☺ café".encode("utf-8")
+
+
+def test_filter_less_or_equal_unpack() -> None:
+    data = base64.b64decode("piUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+
+    assert consumed == len(data)
+    assert isinstance(actual, f.FilterLessOrEqual)
+    assert actual.attribute == "objectClass;test"
+    assert actual.value == "abc def ☺ café".encode("utf-8")
+
+
+def test_filter_present_unpack() -> None:
+    data = base64.b64decode("hxIxLjIuMy4zNDEuMC4xO3Rlc3Q=")
+    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+
+    assert consumed == len(data)
+    assert isinstance(actual, f.FilterPresent)
+    assert actual.attribute == "1.2.3.341.0.1;test"
+
+
+def test_filter_approx_match_unpack() -> None:
+    data = base64.b64decode("qCUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+
+    assert consumed == len(data)
+    assert isinstance(actual, f.FilterApproxMatch)
+    assert actual.attribute == "objectClass;test"
+    assert actual.value == "abc def ☺ café".encode("utf-8")
+
+
+# FIXME: Add tests for this
+# def test_filter_extensible_match_unpack() -> None:
+#     data = base64.b64decode("")
+#     actual, consumed = f.LDAPFilter.unpack(memoryview(data))

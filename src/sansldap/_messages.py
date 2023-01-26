@@ -20,6 +20,7 @@ from ._asn1 import (
     read_asn1_integer,
     read_asn1_octet_string,
     read_asn1_sequence,
+    read_asn1_set,
 )
 from ._controls import LDAPControl
 from ._filter import LDAPFilter
@@ -129,10 +130,6 @@ class LDAPMessage:
     message_id: int
     controls: t.List[LDAPControl]
 
-    def to_bytes(self) -> bytes:
-        pack_asn1(TagClass.APPLICATION, True, self.tag_number, b"")
-        return b""
-
     @classmethod
     def unpack(
         cls,
@@ -155,7 +152,7 @@ class LDAPMessage:
         if protocol_op_tag.tag_class != TagClass.APPLICATION:
             raise ValueError(f"Expecting LDAPMessage.protocolOp to be an APPLICATION but got {protocol_op_tag}")
 
-        unpack_func = PROTOCOL_UNPACKER.get(protocol_op_tag.tag_number, None)
+        unpack_func = PROTOCOL_PACKER.get(protocol_op_tag.tag_number, None)
         if not unpack_func:
             raise NotImplementedError(f"Unknown LDAPMessage.protocolOp choice {protocol_op_tag.tag_number}")
 
@@ -198,13 +195,21 @@ class LDAPMessage:
 
             sequence_view = sequence_view[next_header.tag_length + next_header.length :]
 
-        msg = unpack_func(msg_sequence, message_id, controls)
+        msg = unpack_func[1](msg_sequence, message_id, controls)
 
         # Need to inject the MS-ADTS extension to this message.
         if isinstance(msg, ExtendedResponse) and response_name and not msg.name:
             msg.name = response_name
 
         return msg, total_consumed
+
+    def pack(self) -> bytes:
+        writer = ASN1Writer()
+
+        pack_func = PROTOCOL_PACKER[self.tag_number][0]
+        pack_func(writer)
+
+        return b""
 
 
 @dataclasses.dataclass
@@ -214,11 +219,11 @@ class BindRequest(LDAPMessage):
     version: int
     name: str
 
-    def to_bytes(self) -> bytes:
-        # pack_asn1(TagClass.APPLICATION, False, TypeTagNumber.INTEGER, self.version)
-        # pack_asn1(TagClass.APPLICATION, False, TypeTagNumber.OCTET_STRING, self.name.encode("utf-8"))
 
-        return b""
+def _pack_bind_request(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
 
 
 def _unpack_bind_request(
@@ -249,20 +254,6 @@ class BindRequestSimple(BindRequest):
     bind_request_choice = 0
 
     password: str
-
-    def to_bytes(self) -> bytes:
-        # writer = ASN1Writer()
-
-        # with writer.push_sequence(ASN1Tag(TagClass.APPLICATION, self.tag_number, True)):
-        #     writer.write_integer(self.version)
-        #     writer.write_octet_string(self.name.encode("utf-8"))
-
-        #     writer.write_octet_string(
-        #         self.password.encode("utf-8"),
-        #         tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, 0, False),
-        #     )
-
-        return b""
 
 
 def _unpack_bind_request_simple(
@@ -295,21 +286,6 @@ class BindRequestSasl(BindRequest):
 
     mechanism: str
     credentials: t.Optional[bytes]
-
-    def to_bytes(self) -> bytes:
-        # writer = ASN1Writer()
-
-        # with writer.push_sequence(ASN1Tag(TagClass.APPLICATION, self.tag_number, True)):
-        #     writer.write_integer(self.version)
-        #     writer.write_octet_string(self.name.encode("utf-8"))
-
-        #     with writer.push_sequence(ASN1Tag(TagClass.CONTEXT_SPECIFIC, 3, False)):
-        #         writer.write_octet_string(self.mechanism.encode("utf-8"))
-
-        #         if self.credentials:
-        #             writer.write_octet_string(self.credentials)
-
-        return b""
 
 
 def _unpack_bind_request_sasl(
@@ -356,6 +332,12 @@ class BindResponse(LDAPMessage):
     server_sasl_creds: t.Optional[bytes] = None
 
 
+def _pack_bind_response(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
+
+
 def _unpack_bind_response(
     view: memoryview,
     message_id: int,
@@ -390,6 +372,12 @@ class UnbindRequest(LDAPMessage):
     tag_number = 2
 
 
+def _pack_unbind_request(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
+
+
 @dataclasses.dataclass
 class SearchRequest(LDAPMessage):
     tag_number = 3
@@ -402,6 +390,12 @@ class SearchRequest(LDAPMessage):
     types_only: bool
     filter: LDAPFilter
     attributes: t.List[str]
+
+
+def _pack_search_request(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
 
 
 def _unpack_search_request(
@@ -463,6 +457,42 @@ class SearchResultEntry(LDAPMessage):
     attributes: t.List[PartialAttribute]
 
 
+def _pack_search_result_entry(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
+
+
+def _unpack_search_result_entry(
+    view: memoryview,
+    message_id: int,
+    controls: t.List[LDAPControl],
+) -> SearchResultEntry:
+    # SearchResultEntry ::= [APPLICATION 4] SEQUENCE {
+    #      objectName      LDAPDN,
+    #      attributes      PartialAttributeList }
+
+    # PartialAttributeList ::= SEQUENCE OF
+    #                      partialAttribute PartialAttribute
+
+    object_name, consumed = read_asn1_octet_string(view, hint="SearchResultEntry.objectName")
+    view = view[consumed:]
+
+    attr_view = read_asn1_sequence(view, hint="SearchResultEntry.attributes")[0]
+    attributes: t.List[PartialAttribute] = []
+    while attr_view:
+        attr, consumed = _unpack_partial_attribute(attr_view)
+        attributes.append(attr)
+        attr_view = attr_view[consumed:]
+
+    return SearchResultEntry(
+        message_id=message_id,
+        controls=controls,
+        object_name=object_name.tobytes().decode("utf-8"),
+        attributes=attributes,
+    )
+
+
 @dataclasses.dataclass
 class SearchResultDone(LDAPMessage):
     tag_number = 5
@@ -470,11 +500,54 @@ class SearchResultDone(LDAPMessage):
     result: LDAPResult
 
 
+def _pack_search_result_done(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
+
+
+def _unpack_search_result_done(
+    view: memoryview,
+    message_id: int,
+    controls: t.List[LDAPControl],
+) -> SearchResultDone:
+    result = _unpack_ldap_result(view)[0]
+    return SearchResultDone(
+        message_id=message_id,
+        controls=controls,
+        result=result,
+    )
+
+
 @dataclasses.dataclass
 class SearchResultReference(LDAPMessage):
     tag_number = 19
 
     uris: t.List[str]
+
+
+def _pack_search_result_reference(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
+
+
+def _unpack_search_result_reference(
+    view: memoryview,
+    message_id: int,
+    controls: t.List[LDAPControl],
+) -> SearchResultReference:
+    uris: t.List[str] = []
+    while view:
+        uri, consumed = read_asn1_octet_string(view, hint="SearchResultReference.uri")
+        view = view[consumed:]
+        uris.append(uri.tobytes().decode("utf-8"))
+
+    return SearchResultReference(
+        message_id=message_id,
+        controls=controls,
+        uris=uris,
+    )
 
 
 @dataclasses.dataclass
@@ -485,6 +558,54 @@ class ExtendedRequest(LDAPMessage):
     value: t.Optional[bytes]
 
 
+def _pack_extended_request(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
+
+
+def _unpack_extended_request(
+    view: memoryview,
+    message_id: int,
+    controls: t.List[LDAPControl],
+) -> ExtendedRequest:
+    # ExtendedRequest ::= [APPLICATION 23] SEQUENCE {
+    #      requestName      [0] LDAPOID,
+    #      requestValue     [1] OCTET STRING OPTIONAL }
+
+    name, consumed = read_asn1_octet_string(
+        view,
+        tag=ASN1Tag(
+            tag_class=TagClass.CONTEXT_SPECIFIC,
+            tag_number=0,
+            is_constructed=False,
+        ),
+        hint="ExtendedRequest.requestName",
+    )
+    view = view[consumed:]
+
+    value: t.Optional[bytes] = None
+    while view:
+        next_header = read_asn1_header(view)
+
+        if next_header.tag.tag_class == TagClass.CONTEXT_SPECIFIC and next_header.tag.tag_number == 1:
+            value = read_asn1_octet_string(
+                view,
+                header=next_header,
+                hint="ExtendedRequest.requestValue",
+            )[0].tobytes()
+            break
+
+        view = view[next_header.tag_length + next_header.length :]
+
+    return ExtendedRequest(
+        message_id=message_id,
+        controls=controls,
+        name=name.tobytes().decode("utf-8"),
+        value=value,
+    )
+
+
 @dataclasses.dataclass
 class ExtendedResponse(LDAPMessage):
     tag_number = 24
@@ -492,6 +613,58 @@ class ExtendedResponse(LDAPMessage):
     result: LDAPResult
     name: t.Optional[str]
     value: t.Optional[bytes]
+
+
+def _pack_extended_response(
+    writer: ASN1Writer,
+) -> None:
+    raise NotImplementedError()
+
+
+def _unpack_extended_response(
+    view: memoryview,
+    message_id: int,
+    controls: t.List[LDAPControl],
+) -> ExtendedResponse:
+    # ExtendedResponse ::= [APPLICATION 24] SEQUENCE {
+    #      COMPONENTS OF LDAPResult,
+    #      responseName     [10] LDAPOID OPTIONAL,
+    #      responseValue    [11] OCTET STRING OPTIONAL }
+    result, consumed = _unpack_ldap_result(view)
+    view = view[consumed:]
+    name: t.Optional[str] = None
+    value: t.Optional[bytes] = None
+
+    while view:
+        next_header = read_asn1_header(view)
+        if next_header.tag.tag_class == TagClass.CONTEXT_SPECIFIC:
+            if next_header.tag.tag_number == 10:
+                name = (
+                    read_asn1_octet_string(
+                        view,
+                        header=next_header,
+                        hint="ExtendedResponse.responseName",
+                    )[0]
+                    .tobytes()
+                    .decode("utf-8")
+                )
+
+            elif next_header.tag.tag_number == 11:
+                value = read_asn1_octet_string(
+                    view,
+                    header=next_header,
+                    hint="ExtendedResponse.responseValue",
+                )[0].tobytes()
+
+        view = view[next_header.tag_length + next_header.length :]
+
+    return ExtendedResponse(
+        message_id=message_id,
+        controls=controls,
+        result=result,
+        name=name,
+        value=value,
+    )
 
 
 @dataclasses.dataclass
@@ -565,6 +738,30 @@ class PartialAttribute:
     values: t.List[bytes]
 
 
+def _unpack_partial_attribute(
+    view: memoryview,
+) -> t.Tuple[PartialAttribute, int]:
+    view, total_consumed = read_asn1_sequence(view, hint="PartialAttribute")
+
+    description, consumed = read_asn1_octet_string(view, hint="PartialAttribute.type")
+    view = view[consumed:]
+
+    values_view = read_asn1_set(view, hint="PartialAttribute.vals")[0]
+    values: t.List[bytes] = []
+    while values_view:
+        val, consumed = read_asn1_octet_string(values_view, hint="PartialAttribute.vals.value")
+        values_view = values_view[consumed:]
+        values.append(val.tobytes())
+
+    return (
+        PartialAttribute(
+            name=description.tobytes().decode("utf-8"),
+            values=values,
+        ),
+        total_consumed,
+    )
+
+
 BIND_REQUEST_UNPACKER: t.Dict[
     int, t.Callable[[memoryview, ASN1Tag, int, t.List[LDAPControl], int, str], BindRequest]
 ] = {
@@ -572,8 +769,20 @@ BIND_REQUEST_UNPACKER: t.Dict[
     BindRequestSasl.bind_request_choice: _unpack_bind_request_sasl,
 }
 
-PROTOCOL_UNPACKER: t.Dict[int, t.Callable[[memoryview, int, t.List[LDAPControl]], LDAPMessage]] = {
-    BindRequest.tag_number: _unpack_bind_request,
-    BindResponse.tag_number: _unpack_bind_response,
-    SearchRequest.tag_number: _unpack_search_request,
+PROTOCOL_PACKER: t.Dict[
+    int,
+    t.Tuple[
+        t.Callable[[ASN1Writer], None],
+        t.Callable[[memoryview, int, t.List[LDAPControl]], LDAPMessage],
+    ],
+] = {
+    BindRequest.tag_number: (_pack_bind_request, _unpack_bind_request),
+    BindResponse.tag_number: (_pack_bind_response, _unpack_bind_response),
+    UnbindRequest.tag_number: (_pack_unbind_request, lambda v, m, c: UnbindRequest(message_id=m, controls=c)),
+    SearchRequest.tag_number: (_pack_search_request, _unpack_search_request),
+    SearchResultEntry.tag_number: (_pack_search_result_entry, _unpack_search_result_entry),
+    SearchResultDone.tag_number: (_pack_search_result_done, _unpack_search_result_done),
+    SearchResultReference.tag_number: (_pack_search_result_reference, _unpack_search_result_reference),
+    ExtendedRequest.tag_number: (_pack_extended_request, _unpack_extended_request),
+    ExtendedResponse.tag_number: (_pack_extended_response, _unpack_extended_response),
 }

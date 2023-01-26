@@ -487,27 +487,6 @@ class ASN1Sequence:
 #     return tlv
 
 
-# def get_sequence_value(
-#     sequence: t.Dict[int, ASN1Value],
-#     tag: int,
-#     structure_name: str,
-#     field_name: t.Optional[str] = None,
-#     unpack_func: t.Optional[t.Callable[[t.Union[bytes, ASN1Value]], t.Any]] = None,
-# ) -> t.Any:
-#     """Gets an optional tag entry in a tagged sequence will a further unpacking of the value."""
-#     if tag not in sequence:
-#         return
-
-#     if not unpack_func:
-#         return sequence[tag]
-
-#     try:
-#         return unpack_func(sequence[tag])
-#     except ValueError as e:
-#         where = "%s in %s" % (field_name, structure_name) if field_name else structure_name
-#         raise ValueError("Failed unpacking %s: %s" % (where, str(e))) from e
-
-
 # def pack_asn1_bit_string(
 #     value: bytes,
 #     tag: bool = True,
@@ -635,64 +614,3 @@ class ASN1Sequence:
 #         b_data = pack_asn1(TagClass.UNIVERSAL, True, TypeTagNumber.sequence, b_data)
 
 #     return b_data
-
-
-# def unpack_asn1_bit_string(value: t.Union[ASN1Value, bytes]) -> bytes:
-#     """Unpacks an ASN.1 BIT STRING value."""
-#     b_data = extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.BIT_STRING)
-
-#     # First octet is the number of unused bits in the last octet from the LSB.
-#     unused_bits = struct.unpack("B", b_data[:1])[0]
-#     last_octet = struct.unpack("B", b_data[-2:-1])[0]
-#     last_octet = (last_octet >> unused_bits) << unused_bits
-
-#     return b_data[1:-1] + struct.pack("B", last_octet)
-
-
-# def unpack_asn1_general_string(value: t.Union[ASN1Value, bytes]) -> bytes:
-#     """Unpacks an ASN.1 GeneralString value."""
-#     return extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.general_string)
-
-
-# def unpack_asn1_generalized_time(value: t.Union[ASN1Value, bytes]) -> datetime.datetime:
-#     """Unpacks an ASN.1 GeneralizedTime value."""
-#     data = extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.generalized_time).decode("utf-8")
-
-#     # While ASN.1 can have a timezone encoded, KerberosTime is the only thing we use and it is always in UTC with the
-#     # Z prefix. We strip out the Z because Python 2 doesn't support the %z identifier and add the UTC tz to the object.
-#     # https://www.rfc-editor.org/rfc/rfc4120#section-5.2.3
-#     if data.endswith("Z"):
-#         data = data[:-1]
-
-#     err = None
-#     for datetime_format in ["%Y%m%d%H%M%S.%f", "%Y%m%d%H%M%S"]:
-#         try:
-#             dt = datetime.datetime.strptime(data, datetime_format)
-#             return dt.replace(tzinfo=datetime.timezone.utc)
-#         except ValueError as e:
-#             err = e
-
-#     else:
-#         raise err  # type: ignore
-
-
-# def unpack_asn1_object_identifier(value: t.Union[ASN1Value, bytes]) -> str:
-#     """Unpacks an ASN.1 OBJECT IDENTIFIER value."""
-#     b_data = extract_asn1_tlv(value, TagClass.UNIVERSAL, TypeTagNumber.object_identifier)
-
-#     first_element = struct.unpack("B", b_data[:1])[0]
-#     second_element = first_element % 40
-#     ids = [(first_element - second_element) // 40, second_element]
-
-#     idx = 1
-#     while idx != len(b_data):
-#         oid, octet_len = _unpack_asn1_octet_number(b_data[idx:])
-#         ids.append(oid)
-#         idx += octet_len
-
-#     return ".".join([str(i) for i in ids])
-
-
-# def unpack_asn1_tagged_sequence(value: t.Union[ASN1Value, bytes]) -> t.Dict[int, ASN1Value]:
-#     """Unpacks an ASN.1 SEQUENCE value as a dictionary."""
-#     return dict([(e.tag_number, unpack_asn1(e.b_data)[0]) for e in unpack_asn1_sequence(value)])
