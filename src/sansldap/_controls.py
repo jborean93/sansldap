@@ -6,15 +6,50 @@ from __future__ import annotations
 import dataclasses
 import typing as t
 
-from ._asn1 import (
-    TagClass,
-    TypeTagNumber,
-    read_asn1_boolean,
-    read_asn1_header,
-    read_asn1_integer,
-    read_asn1_octet_string,
-    read_asn1_sequence,
-)
+from ._asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass, TypeTagNumber
+
+
+def unpack_ldap_control(
+    reader: ASN1Reader,
+) -> LDAPControl:
+    control_reader = reader.read_sequence(hint="Control")
+
+    control_type = control_reader.read_octet_string(
+        hint="Control.controlType",
+    ).decode("utf-8")
+
+    unpack_func = CONTROL_UNPACKER.get(control_type, None)
+    criticality = False
+
+    next_header = control_reader.peek_header()
+    if next_header.tag.tag_class == TagClass.UNIVERSAL and next_header.tag.tag_number == TypeTagNumber.BOOLEAN:
+        criticality = control_reader.read_boolean(
+            header=next_header,
+            hint="Control.criticality",
+        )
+        next_header = control_reader.peek_header()
+
+    control_value: t.Optional[bytes] = None
+    if next_header.tag.tag_class == TagClass.UNIVERSAL and next_header.tag.tag_number == TypeTagNumber.OCTET_STRING:
+        if unpack_func:
+            value_reader = control_reader.read_sequence(
+                header=next_header,
+                hint="Control.controlValue",
+            )
+
+            return unpack_func(value_reader, criticality)
+
+        else:
+            control_value = control_reader.read_octet_string(
+                header=next_header,
+                hint="Control.controlValue",
+            )
+
+    return LDAPControl(
+        control_type=control_type,
+        critical=criticality,
+        value=control_value,
+    )
 
 
 @dataclasses.dataclass
@@ -32,58 +67,24 @@ class LDAPControl:
     critical: bool
     value: t.Optional[bytes]
 
-    @classmethod
-    def unpack(
-        cls,
-        view: memoryview,
-    ) -> t.Tuple[LDAPControl, int]:
-        control_view, consumed = read_asn1_sequence(
-            view,
-            hint="Control",
-        )
+    def _pack_internal(
+        self,
+        writer: ASN1Writer,
+    ) -> None:
+        with writer.push_sequence() as control_writer:
+            control_writer.write_octet_string(self.control_type.encode("utf-8"))
 
-        raw_control_type, seq_consumed = read_asn1_octet_string(control_view, hint="Control.controlType")
-        control_type = raw_control_type.tobytes().decode("utf-8")
-        control_view = control_view[seq_consumed:]
+            if self.critical:
+                control_writer.write_boolean(self.critical)
 
-        criticality = False
-        control_value = memoryview(b"")
+            self._write_value(control_writer)
 
-        while control_view:
-            # As these fields are optional we scan the header to see what the
-            # next value is.
-            next_header = read_asn1_header(control_view)
-
-            if next_header.tag.tag_class == TagClass.UNIVERSAL:
-                if next_header.tag.tag_number == TypeTagNumber.BOOLEAN:
-                    criticality = read_asn1_boolean(
-                        control_view,
-                        header=next_header,
-                        hint="Control.criticality",
-                    )[0]
-
-                if next_header.tag.tag_number == TypeTagNumber.OCTET_STRING:
-                    control_value = read_asn1_octet_string(
-                        control_view,
-                        header=next_header,
-                        hint="Control.controlValue",
-                    )[0]
-
-            control_view = control_view[next_header.tag_length + next_header.length :]
-
-        unpack_func = CONTROL_UNPACKER.get(control_type, None)
-        if unpack_func:
-            return unpack_func(criticality, control_value), consumed
-
-        else:
-            return (
-                LDAPControl(
-                    control_type=control_type,
-                    critical=criticality,
-                    value=control_value.tobytes() if control_value else None,
-                ),
-                consumed,
-            )
+    def _write_value(
+        self,
+        writer: ASN1Writer,
+    ) -> None:
+        if self.value is not None:
+            writer.write_octet_string(self.value)
 
 
 @dataclasses.dataclass
@@ -106,17 +107,27 @@ class PagedResultControl(LDAPControl):
     size: int
     cookie: bytes
 
+    def _write_value(
+        self,
+        writer: ASN1Writer,
+    ) -> None:
+        # Write it like a sequence but with an OCTET_STRING tag
+        with writer.push_sequence(
+            ASN1Tag.universal_tag(TypeTagNumber.OCTET_STRING, False),
+        ) as value_writer:
+            with value_writer.push_sequence() as inner_writer:
+                inner_writer.write_integer(self.size)
+                inner_writer.write_octet_string(self.cookie)
+
 
 def _unpack_paged_result_control(
+    reader: ASN1Reader,
     critical: bool,
-    view: memoryview,
 ) -> PagedResultControl:
-    view = read_asn1_sequence(view, hint="PagedResultControl")[0]
+    control_reader = reader.read_sequence(hint="PagedResultControl")
 
-    size, consumed = read_asn1_integer(view, hint="PagedResultControl.size")
-    view = view[consumed:]
-
-    cookie = read_asn1_octet_string(view, hint="PagedResultControl.cookie")[0].tobytes()
+    size = control_reader.read_integer(hint="PagedResultControl.size")
+    cookie = control_reader.read_octet_string(hint="PagedResultControl.cookie")
 
     return PagedResultControl(
         critical=critical,
@@ -125,8 +136,8 @@ def _unpack_paged_result_control(
     )
 
 
-CONTROL_UNPACKER: t.Dict[str, t.Callable[[bool, memoryview], LDAPControl]] = {
-    ShowDeletedControl.control_type: lambda c, v: ShowDeletedControl(critical=c),
-    ShowDeactivatedLinkControl.control_type: lambda c, v: ShowDeactivatedLinkControl(critical=c),
+CONTROL_UNPACKER: t.Dict[str, t.Callable[[ASN1Reader, bool], LDAPControl]] = {
+    ShowDeletedControl.control_type: lambda r, c: ShowDeletedControl(critical=c),
+    ShowDeactivatedLinkControl.control_type: lambda r, c: ShowDeactivatedLinkControl(critical=c),
     PagedResultControl.control_type: _unpack_paged_result_control,
 }

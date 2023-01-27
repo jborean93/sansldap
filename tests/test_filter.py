@@ -7,15 +7,20 @@ import typing as t
 import pytest
 
 import sansldap._filter as f
+from sansldap._asn1 import ASN1Reader
+
+
+def unpack_filter(data: bytes) -> f.LDAPFilter:
+    reader = ASN1Reader(data)
+    return f.unpack_ldap_filter(reader)
 
 
 def test_filter_and_unpack() -> None:
     data = base64.b64decode(
         "oEmjCgQDZm9vBANiYXKgO6QYBARhdHRyMBCAA2FiY4EEdGVzdIIDZW5kqRKBBHJ1bGWCBGF0dHKDBHRlc3SgC6UJBAR0ZXN0BAEx"
     )
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterAnd)
     assert len(actual.filters) == 2
 
@@ -46,9 +51,8 @@ def test_filter_and_unpack() -> None:
 
 def test_filter_or_unpack() -> None:
     data = base64.b64decode("oTijCgQDZm9vBANiYXKhKocEYXR0cqkVgQRydWxlggRhdHRygwR0ZXN0hAH/oAumCQQEdGVzdAQBMQ==")
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterOr)
     assert len(actual.filters) == 2
 
@@ -77,9 +81,8 @@ def test_filter_or_unpack() -> None:
 
 def test_filter_not_unpack() -> None:
     data = base64.b64decode("og6iDKMKBANmb28EA2Jhcg==")
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterNot)
     assert isinstance(actual.filter, f.FilterNot)
     assert isinstance(actual.filter.filter, f.FilterEquality)
@@ -89,9 +92,8 @@ def test_filter_not_unpack() -> None:
 
 def test_filter_equality_unpack() -> None:
     data = base64.b64decode("oyUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterEquality)
     assert actual.attribute == "objectClass;test"
     assert actual.value == "abc def ☺ café".encode("utf-8")
@@ -144,9 +146,8 @@ def test_filter_substrings_unpack(
     data: str,
 ) -> None:
     b_data = base64.b64decode(data)
-    actual, consumed = f.LDAPFilter.unpack(memoryview(b_data))
+    actual = unpack_filter(b_data)
 
-    assert consumed == len(b_data)
     assert isinstance(actual, f.FilterSubstrings)
     assert actual.attribute == attribute
     assert actual.initial == (initial.encode("utf-8") if initial else None)
@@ -156,9 +157,8 @@ def test_filter_substrings_unpack(
 
 def test_filter_greater_or_equal_unpack() -> None:
     data = base64.b64decode("pSUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterGreaterOrEqual)
     assert actual.attribute == "objectClass;test"
     assert actual.value == "abc def ☺ café".encode("utf-8")
@@ -166,9 +166,8 @@ def test_filter_greater_or_equal_unpack() -> None:
 
 def test_filter_less_or_equal_unpack() -> None:
     data = base64.b64decode("piUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterLessOrEqual)
     assert actual.attribute == "objectClass;test"
     assert actual.value == "abc def ☺ café".encode("utf-8")
@@ -176,18 +175,16 @@ def test_filter_less_or_equal_unpack() -> None:
 
 def test_filter_present_unpack() -> None:
     data = base64.b64decode("hxIxLjIuMy4zNDEuMC4xO3Rlc3Q=")
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterPresent)
     assert actual.attribute == "1.2.3.341.0.1;test"
 
 
 def test_filter_approx_match_unpack() -> None:
     data = base64.b64decode("qCUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
-    actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+    actual = unpack_filter(data)
 
-    assert consumed == len(data)
     assert isinstance(actual, f.FilterApproxMatch)
     assert actual.attribute == "objectClass;test"
     assert actual.value == "abc def ☺ café".encode("utf-8")
@@ -196,4 +193,4 @@ def test_filter_approx_match_unpack() -> None:
 # FIXME: Add tests for this
 # def test_filter_extensible_match_unpack() -> None:
 #     data = base64.b64decode("")
-#     actual, consumed = f.LDAPFilter.unpack(memoryview(data))
+#     actual = unpack_filter(data)
