@@ -11,6 +11,10 @@ from types import TracebackType
 T = t.TypeVar("T", bound=int)
 
 
+class NotEnougData(Exception):
+    ...
+
+
 class TagClass(enum.IntEnum):
     UNIVERSAL = 0
     APPLICATION = 1
@@ -471,6 +475,9 @@ def _read_asn1_header(
     """
     view = memoryview(data)
 
+    if not view:
+        raise NotEnougData()
+
     octet1 = struct.unpack("B", view[:1])[0]
     tag_class = TagClass((octet1 & 0b11000000) >> 6)
     constructed = bool(octet1 & 0b00100000)
@@ -485,6 +492,9 @@ def _read_asn1_header(
         tag_number = TypeTagNumber(tag_number)
 
     view = view[tag_octets:]
+
+    if not view:
+        raise NotEnougData()
 
     length = struct.unpack("B", view[:1])[0]
     length_octets = 1
@@ -501,6 +511,9 @@ def _read_asn1_header(
         length = 0
 
         for idx in range(1, length_octets):
+            if len(view) < (idx + 1):
+                raise NotEnougData()
+
             octet_val = struct.unpack("B", view[idx : idx + 1])[0]
             length += octet_val << (8 * (length_octets - 1 - idx))
 
@@ -643,7 +656,7 @@ def _validate_tag(
         raise NotImplementedError("Indefinite length not implemented yet")
 
     if len(view) < data_length:
-        raise ValueError(f"Not enough data{hint_str}: expecting {data_length} but got {len(view)}")
+        raise NotEnougData(f"Not enough data{hint_str}: expecting {data_length} but got {len(view)}")
 
     return view[:data_length], tag_length + data_length
 
@@ -655,6 +668,9 @@ def _unpack_asn1_octet_number(
     i = 0
     idx = 0
     while True:
+        if len(data) < (idx + 1):
+            raise NotEnougData()
+
         element = struct.unpack("B", data[idx : idx + 1])[0]
         idx += 1
 
