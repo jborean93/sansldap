@@ -12,14 +12,107 @@ from ._controls import LDAPControl, unpack_ldap_control
 from ._filter import LDAPFilter, unpack_ldap_filter
 
 
+def unpack_ldap_message(
+    reader: ASN1Reader,
+) -> LDAPMessage:
+    """Unpack an LDAP message.
+
+    Unpacks the raw ASN.1 value in the reader specified into an LDAP message
+    object.
+
+    Args:
+        reader: The ASN.1 reader to read from.
+
+    Returns:
+        LDAPMessage: The unpacked message object.
+    """
+    message = reader.read_sequence(hint="LDAPMessage")
+    message_id = message.read_integer(hint="LDAPMessage.messageId")
+
+    protocol_op_header = message.peek_header()
+    protocol_op_tag = protocol_op_header.tag
+    if protocol_op_tag.tag_class != TagClass.APPLICATION:
+        raise ValueError(f"Expecting LDAPMessage.protocolOp to be an APPLICATION but got {protocol_op_tag}")
+
+    unpack_func = PROTOCOL_PACKER.get(protocol_op_tag.tag_number, None)
+    if not unpack_func:
+        raise NotImplementedError(f"Unknown LDAPMessage.protocolOp choice {protocol_op_tag.tag_number}")
+
+    protocol_reader = message.read_sequence(
+        header=protocol_op_header,
+        hint="LDAPMessage.protocolOp",
+    )
+
+    controls: t.List[LDAPControl] = []
+    response_name: t.Optional[str] = None
+    while message:
+        next_header = message.peek_header()
+
+        if next_header.tag.tag_class == TagClass.CONTEXT_SPECIFIC:
+            if next_header.tag.tag_number == 0:
+                control_reader = message.read_sequence(
+                    header=next_header,
+                    hint="LDAPMessage.controls",
+                )
+                while control_reader:
+                    control = unpack_ldap_control(control_reader)
+                    controls.append(control)
+
+                continue
+
+            elif next_header.tag.tag_number == 10:
+                # Defined in MS-ADTS - NoticeOfDisconnectionLDAPMessage.
+                # This is an extension of LDAPMessage in the RFC but AD
+                # replies with this on critical failures where it has torn
+                # down the connection.
+                # responseName    [10] LDAPOID
+                response_name = message.read_octet_string(
+                    header=next_header,
+                    hint="LDAPMessage.responseName",
+                ).decode(reader.string_encoding)
+                continue
+
+        message.skip_value(next_header)
+
+    msg = unpack_func(protocol_reader, message_id, controls)
+
+    # Need to inject the MS-ADTS extension to this message.
+    if isinstance(msg, ExtendedResponse) and response_name and not msg.name:
+        msg.name = response_name
+
+    return msg
+
+
 class DereferencingPolicy(enum.IntEnum):
+    """Control alias dereferencing during a search."""
+
     NEVER = 0
+    """
+    Do not reference aliases in search or in locating the base object the search.
+    """
+
     IN_SEARCHING = 1
+    """
+    While searching subordinates of the base object, dereference any alias
+    within the search scope.
+    """
+
     FINDING_BASE_OBJ = 2
+    """
+    Dereference aliases in locating the base object of the search, but not when
+    searching subordinates of the base object.
+    """
+
     ALWAYS = 3
+    """
+    Dererence aliases both in searching and in locating the base object of the
+    search.
+    """
 
 
 class LDAPResultCode(enum.IntEnum):
+    """The known LDAP result codes."""
+
     SUCCESS = 0
     OPERATIONS_ERROR = 1
     PROTOCOL_ERROR = 2
@@ -60,127 +153,93 @@ class LDAPResultCode(enum.IntEnum):
     AFFECTS_MULTIPLE_DSAS = 71
     OTHER = 80
 
+    @classmethod
+    def _missing_(cls, value: object) -> t.Any:
+        # As the result codes are extensible it is possible to receive a code
+        # that the client does not know about, handle that gracefully here.
+        if not isinstance(value, int):
+            return None
+
+        new_member = int.__new__(cls)
+        new_member._name_ = "UNKNOWN 0x{0:08X}".format(value)
+        new_member._value_ = value
+
+        return cls._value2member_map_.setdefault(value, new_member)
+
 
 class SearchScope(enum.IntEnum):
+    """Specifies the scope of the search to perform."""
+
     BASE = 0
+    "The scope is constrained to the entry named by base_object"
+
     ONE_LEVEL = 1
+    "The scope is constrained to the immediate subordinates of base_object."
+
     SUBTREE = 2
+    "The scope is constrained to base_object and all its subordinates."
 
 
 @dataclasses.dataclass
 class LDAPMessage:
     """The base LDAP Message object.
 
-    This is the base object used for all LDAP messages.
+    This is the base object used for all LDAP messages. The base message
+    structure is defined in `RFC 4511 4.1.1. Message Envelope`_.
 
     Args:
         message_id: The unique identifier for the request.
-        controls: A list of controls
+        controls: A list of controls associated with the message.
 
     Attributes:
-        tag_number: The protocolOp choice for this message type.
+        tag_number: The protocolOp choice for this message type. This is
+            defined on each LDAPMessage sub class.
 
-
-    LDAPMessage ::= SEQUENCE {
-            messageID       MessageID,
-            protocolOp      CHOICE {
-                bindRequest           BindRequest,
-                bindResponse          BindResponse,
-                unbindRequest         UnbindRequest,
-                searchRequest         SearchRequest,
-                searchResEntry        SearchResultEntry,
-                searchResDone         SearchResultDone,
-                searchResRef          SearchResultReference,
-                modifyRequest         ModifyRequest,
-                modifyResponse        ModifyResponse,
-                addRequest            AddRequest,
-                addResponse           AddResponse,
-                delRequest            DelRequest,
-                delResponse           DelResponse,
-                modDNRequest          ModifyDNRequest,
-                modDNResponse         ModifyDNResponse,
-                compareRequest        CompareRequest,
-                compareResponse       CompareResponse,
-                abandonRequest        AbandonRequest,
-                extendedReq           ExtendedRequest,
-                extendedResp          ExtendedResponse,
-                ...,
-                intermediateResponse  IntermediateResponse },
-            controls       [0] Controls OPTIONAL }
-
-    https://datatracker.ietf.org/doc/html/rfc4511#section-4.1.1
+    .. _RFC 4511 4.1.1. Message Envelope:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.1.1
     """
+
+    # LDAPMessage ::= SEQUENCE {
+    #         messageID       MessageID,
+    #         protocolOp      CHOICE {
+    #             bindRequest           BindRequest,
+    #             bindResponse          BindResponse,
+    #             unbindRequest         UnbindRequest,
+    #             searchRequest         SearchRequest,
+    #             searchResEntry        SearchResultEntry,
+    #             searchResDone         SearchResultDone,
+    #             searchResRef          SearchResultReference,
+    #             modifyRequest         ModifyRequest,
+    #             modifyResponse        ModifyResponse,
+    #             addRequest            AddRequest,
+    #             addResponse           AddResponse,
+    #             delRequest            DelRequest,
+    #             delResponse           DelResponse,
+    #             modDNRequest          ModifyDNRequest,
+    #             modDNResponse         ModifyDNResponse,
+    #             compareRequest        CompareRequest,
+    #             compareResponse       CompareResponse,
+    #             abandonRequest        AbandonRequest,
+    #             extendedReq           ExtendedRequest,
+    #             extendedResp          ExtendedResponse,
+    #             ...,
+    #             intermediateResponse  IntermediateResponse },
+    #         controls       [0] Controls OPTIONAL }
 
     tag_number: int = dataclasses.field(init=False, default=0)
 
     message_id: int
     controls: t.List[LDAPControl]
 
-    @classmethod
-    def unpack(
-        cls,
-        data: t.Union[bytes, bytearray, memoryview],
-    ) -> t.Tuple[LDAPMessage, int]:
-        reader = ASN1Reader(data)
-        info = reader.peek_header()
-
-        message = reader.read_sequence(hint="LDAPMessage")
-        message_id = message.read_integer(hint="LDAPMessage.messageId")
-
-        protocol_op_header = message.peek_header()
-        protocol_op_tag = protocol_op_header.tag
-        if protocol_op_tag.tag_class != TagClass.APPLICATION:
-            raise ValueError(f"Expecting LDAPMessage.protocolOp to be an APPLICATION but got {protocol_op_tag}")
-
-        unpack_func = PROTOCOL_PACKER.get(protocol_op_tag.tag_number, None)
-        if not unpack_func:
-            raise NotImplementedError(f"Unknown LDAPMessage.protocolOp choice {protocol_op_tag.tag_number}")
-
-        protocol_reader = message.read_sequence(
-            header=protocol_op_header,
-            hint="LDAPMessage.protocolOp",
-        )
-
-        controls: t.List[LDAPControl] = []
-        response_name: t.Optional[str] = None
-        while message:
-            next_header = message.peek_header()
-
-            if next_header.tag.tag_class == TagClass.CONTEXT_SPECIFIC:
-                if next_header.tag.tag_number == 0:
-                    control_reader = message.read_sequence(
-                        header=next_header,
-                        hint="LDAPMessage.controls",
-                    )
-                    while control_reader:
-                        control = unpack_ldap_control(control_reader)
-                        controls.append(control)
-
-                    continue
-
-                elif next_header.tag.tag_number == 10:
-                    # Defined in MS-ADTS - NoticeOfDisconnectionLDAPMessage.
-                    # This is an extension of LDAPMessage in the RFC but AD
-                    # replies with this on critical failures where it has torn
-                    # down the connection.
-                    # responseName    [10] LDAPOID
-                    response_name = message.read_octet_string(
-                        header=next_header,
-                        hint="LDAPMessage.responseName",
-                    ).decode("utf-8")
-                    continue
-
-            message.skip_value(next_header)
-
-        msg = unpack_func(protocol_reader, message_id, controls)
-
-        # Need to inject the MS-ADTS extension to this message.
-        if isinstance(msg, ExtendedResponse) and response_name and not msg.name:
-            msg.name = response_name
-
-        return msg, info.tag_length + info.length
-
     def pack(self) -> bytes:
+        """Packs the current message.
+
+        Packs the current message and returns the bytes string that can be
+        exchanged with the peer.
+
+        Returns:
+            bytes: The ASN.1 BER encoded message.
+        """
         writer = ASN1Writer()
 
         with writer.push_sequence() as seq:
@@ -209,6 +268,38 @@ class LDAPMessage:
 
 @dataclasses.dataclass
 class BindRequest(LDAPMessage):
+    """The bind request message.
+
+    This object is used to exchange authentication and security-related
+    semantics between the client and server. The BindRequest structure is
+    defined in `RFC 4511 4.2 Bind Operation`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        version: The version of the LDAP protocol to be used. Currently only
+            version 3 is supported.
+        name: The name of the directory object that the client wishes to bind
+            as. An empty string is used for SASL authentiction or with
+            anonymous binds.
+        authentication: The authentication information, currently either a
+            :class:`SimpleCredential` or :class:`SaslCredential` is supported.
+
+    .. _RFC 4511 4.2. Bind Operation:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.2
+    """
+
+    # BindRequest ::= [APPLICATION 0] SEQUENCE {
+    #      version                 INTEGER (1 ..  127),
+    #      name                    LDAPDN,
+    #      authentication          AuthenticationChoice }
+
+    # AuthenticationChoice ::= CHOICE {
+    #      simple                  [0] OCTET STRING,
+    #                              -- 1 and 2 reserved
+    #      sasl                    [3] SaslCredentials,
+    #      ...  }
+
     tag_number = 0
 
     version: int
@@ -220,7 +311,7 @@ class BindRequest(LDAPMessage):
         writer: ASN1Writer,
     ) -> None:
         writer.write_integer(self.version)
-        writer.write_octet_string(self.name.encode("utf-8"))
+        writer.write_octet_string(self.name.encode(writer.string_encoding))
         self.authentication._pack_inner(writer)
 
 
@@ -230,7 +321,7 @@ def _unpack_bind_request(
     controls: t.List[LDAPControl],
 ) -> BindRequest:
     version = reader.read_integer(hint="BindRequest.version")
-    name = reader.read_octet_string(hint="BindRequest.name").decode("utf-8")
+    name = reader.read_octet_string(hint="BindRequest.name").decode(reader.string_encoding)
 
     next_header = reader.peek_header()
     authentication: t.Optional[t.Union[SimpleCredential, SaslCredential]] = None
@@ -240,7 +331,7 @@ def _unpack_bind_request(
                 header=next_header,
                 hint="BindRequest.authentication.simple",
             )
-            authentication = SimpleCredential(password=password.decode("utf-8"))
+            authentication = SimpleCredential(password=password.decode(reader.string_encoding))
 
         elif next_header.tag.tag_number == SaslCredential.authentication_id:
             sasl_reader = reader.read_sequence(
@@ -250,7 +341,7 @@ def _unpack_bind_request(
 
             mechanism = sasl_reader.read_octet_string(
                 hint="BindRequest.authentication.sasl.mechanism",
-            ).decode("utf-8")
+            ).decode(reader.string_encoding)
 
             credentials = sasl_reader.read_octet_string(
                 hint="BindRequest.authentication.sasl.credentials",
@@ -275,6 +366,26 @@ def _unpack_bind_request(
 
 @dataclasses.dataclass
 class BindResponse(LDAPMessage):
+    """The bind response message.
+
+    This is the response to a :class:`BindRequest`. It contains the status
+    of the client's bind operation and potentially a SASL response token. The
+    BindResponse structure is defined in `RFC 4511 4.2.2. Bind Response`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        result: The LDAP response.
+        server_sasl_creds: Contains the SASL challenge/response.
+
+    .. _RFC 4511 4.2.2. Bind Response:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.2.2
+    """
+
+    # BindResponse ::= [APPLICATION 1] SEQUENCE {
+    #      COMPONENTS OF LDAPResult,
+    #      serverSaslCreds    [7] OCTET STRING OPTIONAL }
+
     tag_number = 1
 
     result: LDAPResult
@@ -323,11 +434,90 @@ def _unpack_bind_response(
 
 @dataclasses.dataclass
 class UnbindRequest(LDAPMessage):
+    """The unbind request message.
+
+    A message used to signal the LDAP session is to be terminated. There is no
+    response as the client or server will terminate the connection after
+    sending. The UnbindRequest structure is defined in
+    `RFC 4511 4.3. Unbind Operation`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+
+    .. _RFC 4511 4.3. Unbind Operation:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.3
+    """
+
     tag_number = 2
+
+    # UnbindRequest ::= [APPLICATION 2] NULL
 
 
 @dataclasses.dataclass
 class SearchRequest(LDAPMessage):
+    """The search request message.
+
+    This object is used to start a search operation with the parameters
+    requested. The SearchRequest structure is defined in
+    `RFC 4511 4.5.1. Search Request`_.
+
+    The LDAP filter is a special object that derives from :class:`LDAPFilter`
+    and is not the LDAP filter string most implementations use. See that class
+    docstring for more information on how to build the LDAPFilter object.
+
+    The following are special attributes that can be requested:
+
+        ``*``: Requests all attributes in addition to the explicitly defined
+            ones.
+        ``1.1``: No attributes are to be returned. Is ignored if there are any
+            other attributes specified.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        base_object: The name of the base object entry (or empty string for
+            root) which the search is to be performed.
+        scope: The scope of the searched. See :class:`SearchScope` for more
+            details.
+        deref_aliases: Indicates how alias entries are to be dereferenced, see
+            :class:`DereferencingPolicy` for more details.
+        size_limit: Retricts the maximum number of entries to be returned. A
+            value of 0 indicates no client requested size limit is in place.
+            The server may also enforce a maximum number of entries to return.
+        time_limit: The time limit, in seconds, allowed for a search. A value
+            of 0 indicates no client requested time limit is in place. The
+            server may enforce its own time limit for a search.
+        types_only: Set to True to only return attribute names and no values in
+            the search result.
+        filter: The LDAP filter to search by. See :class:`LDAPFilter` for more
+            information.
+        attributes: A list of attributes to be returned from each entry that
+            matches the search filter. An empty list requests the return of all
+            user attributes.
+
+    .. _RFC 4511 4.5.1. Search Request:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.5.1
+    """
+
+    # SearchRequest ::= [APPLICATION 3] SEQUENCE {
+    #      baseObject      LDAPDN,
+    #      scope           ENUMERATED {
+    #           baseObject              (0),
+    #           singleLevel             (1),
+    #           wholeSubtree            (2),
+    #           ...  },
+    #      derefAliases    ENUMERATED {
+    #           neverDerefAliases       (0),
+    #           derefInSearching        (1),
+    #           derefFindingBaseObj     (2),
+    #           derefAlways             (3) },
+    #      sizeLimit       INTEGER (0 ..  maxInt),
+    #      timeLimit       INTEGER (0 ..  maxInt),
+    #      typesOnly       BOOLEAN,
+    #      filter          Filter,
+    #      attributes      AttributeSelection }
+
     tag_number = 3
 
     base_object: str
@@ -343,7 +533,7 @@ class SearchRequest(LDAPMessage):
         self,
         writer: ASN1Writer,
     ) -> None:
-        writer.write_octet_string(self.base_object.encode("utf-8"))
+        writer.write_octet_string(self.base_object.encode(writer.string_encoding))
         writer.write_enumerated(self.scope.value)
         writer.write_enumerated(self.deref_aliases.value)
         writer.write_integer(self.size_limit)
@@ -353,7 +543,7 @@ class SearchRequest(LDAPMessage):
 
         with writer.push_sequence_of() as attr_writer:
             for attr in self.attributes:
-                attr_writer.write_octet_string(attr.encode("utf-8"))
+                attr_writer.write_octet_string(attr.encode(writer.string_encoding))
 
 
 def _unpack_search_request(
@@ -378,12 +568,12 @@ def _unpack_search_request(
         attr = attributes_reader.read_octet_string(
             hint="SearchRequest.attributes.value",
         )
-        attributes.append(attr.decode("utf-8"))
+        attributes.append(attr.decode(reader.string_encoding))
 
     return SearchRequest(
         message_id=message_id,
         controls=controls,
-        base_object=base_object.decode("utf-8"),
+        base_object=base_object.decode(reader.string_encoding),
         scope=scope,
         deref_aliases=deref_aliases,
         size_limit=size_limit,
@@ -396,6 +586,28 @@ def _unpack_search_request(
 
 @dataclasses.dataclass
 class SearchResultEntry(LDAPMessage):
+    """The search result entry message.
+
+    This object is used as a response to a search request. The
+    SearchResultEntry structure is defined in `RFC 4511 4.5.2. Search Result`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        object_name: The object the result is associated with.
+        attributes: A list of attributes and their values.
+
+    .. _RFC 4511 4.5.2. Search Result:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.5.2
+    """
+
+    # SearchResultEntry ::= [APPLICATION 4] SEQUENCE {
+    #      objectName      LDAPDN,
+    #      attributes      PartialAttributeList }
+
+    # PartialAttributeList ::= SEQUENCE OF
+    #                      partialAttribute PartialAttribute
+
     tag_number = 4
 
     object_name: str
@@ -405,7 +617,7 @@ class SearchResultEntry(LDAPMessage):
         self,
         writer: ASN1Writer,
     ) -> None:
-        writer.write_octet_string(self.object_name.encode("utf-8"))
+        writer.write_octet_string(self.object_name.encode(writer.string_encoding))
 
         with writer.push_sequence_of() as attr_writer:
             for attribute in self.attributes:
@@ -426,7 +638,7 @@ def _unpack_search_result_entry(
 
     object_name = reader.read_octet_string(
         hint="SearchResultEntry.objectName",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
 
     attributes: t.List[PartialAttribute] = []
     attr_reader = reader.read_sequence(hint="SearchResultEntry.attributes")
@@ -445,6 +657,23 @@ def _unpack_search_result_entry(
 
 @dataclasses.dataclass
 class SearchResultDone(LDAPMessage):
+    """The search result done message.
+
+    This object is used as a response to a search request and marks the end of
+    any results for a search operation. The SearchResultDone structure is
+    defined in `RFC 4511 4.5.2. Search Result`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        result: The LDAP result of the search operation.
+
+    .. _RFC 4511 4.5.2. Search Result:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.5.2
+    """
+
+    # SearchResultDone ::= [APPLICATION 5] LDAPResult
+
     tag_number = 5
 
     result: LDAPResult
@@ -471,6 +700,28 @@ def _unpack_search_result_done(
 
 @dataclasses.dataclass
 class SearchResultReference(LDAPMessage):
+    """The search result reference message.
+
+    Sent by the server in a search request operation when it is unable, or
+    unwilling, to search one or more non-local entries. The result reference
+    contains reference(s) to one or more set of server for continuing the
+    operation. The SearchResultReference structure is defined in
+    `RFC 4511 4.5.2. Search Result`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        uris: The URIs of servers that can be used to continue the search. The
+            URI may be an ``ldap://`` URI but the syntax is not part of this
+            library to interpret.
+
+    .. _RFC 4511 4.5.2. Search Result:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.5.2
+    """
+
+    # SearchResultReference ::= [APPLICATION 19] SEQUENCE
+    #                           SIZE (1..MAX) OF uri URI
+
     tag_number = 19
 
     uris: t.List[str]
@@ -480,7 +731,7 @@ class SearchResultReference(LDAPMessage):
         writer: ASN1Writer,
     ) -> None:
         for uri in self.uris:
-            writer.write_octet_string(uri.encode("utf-8"))
+            writer.write_octet_string(uri.encode(writer.string_encoding))
 
 
 def _unpack_search_result_reference(
@@ -492,7 +743,7 @@ def _unpack_search_result_reference(
     while reader:
         uri = reader.read_octet_string(
             hint="SearchResultReference.uri",
-        ).decode("utf-8")
+        ).decode(reader.string_encoding)
         uris.append(uri)
 
     return SearchResultReference(
@@ -504,6 +755,30 @@ def _unpack_search_result_reference(
 
 @dataclasses.dataclass
 class ExtendedRequest(LDAPMessage):
+    """The extended request message.
+
+    An extended operation is a custom operation not strictly defined in the
+    LDAP RFC. It is used to extend the existing set of operations with custom
+    ones that could be known to the client and server. For example the StartTLS
+    protocol uses an extended operation to start embedding the transport with
+    TLS. The ExtendedRequest structure is defined in
+    `RFC 4511 4.12. Extended Operation`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        name: The extended operation OID string.
+        value: The extended operation value as a byte string. Can be None if
+            the operation does not require a value.
+
+    .. _RFC 4511 4.12. Extended Operation:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.12
+    """
+
+    # ExtendedRequest ::= [APPLICATION 23] SEQUENCE {
+    #      requestName      [0] LDAPOID,
+    #      requestValue     [1] OCTET STRING OPTIONAL }
+
     tag_number = 23
 
     name: str
@@ -511,7 +786,7 @@ class ExtendedRequest(LDAPMessage):
 
     def _pack_inner(self, writer: ASN1Writer) -> None:
         writer.write_octet_string(
-            self.name.encode("utf-8"),
+            self.name.encode(writer.string_encoding),
             tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, 0, False),
         )
 
@@ -538,7 +813,7 @@ def _unpack_extended_request(
             is_constructed=False,
         ),
         hint="ExtendedRequest.requestName",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
 
     value: t.Optional[bytes] = None
     while reader:
@@ -563,6 +838,31 @@ def _unpack_extended_request(
 
 @dataclasses.dataclass
 class ExtendedResponse(LDAPMessage):
+    """The extended response message.
+
+    The response to an extended request and contains the result of the
+    operation as well as extra data associated with the operation. The
+    ExtendedResponse structure is defined in
+    `RFC 4511 4.12. Extended Operation`_.
+
+    Args:
+        message_id: The unique identifier for the request.
+        controls: A list of controls associated with the message.
+        result: The result of the operation.
+        name: The operation OID string that was performced. This is optionally
+            returned by the server.
+        value: The operation data is specific to the operation performed. This
+            is optionally returned by the server.
+
+    .. _RFC 4511 4.12. Extended Operation:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.12
+    """
+
+    # ExtendedResponse ::= [APPLICATION 24] SEQUENCE {
+    #      COMPONENTS OF LDAPResult,
+    #      responseName     [10] LDAPOID OPTIONAL,
+    #      responseValue    [11] OCTET STRING OPTIONAL }
+
     tag_number = 24
 
     result: LDAPResult
@@ -574,7 +874,7 @@ class ExtendedResponse(LDAPMessage):
 
         if self.name is not None:
             writer.write_octet_string(
-                self.name.encode("utf-8"),
+                self.name.encode(writer.string_encoding),
                 ASN1Tag(TagClass.CONTEXT_SPECIFIC, 10, False),
             )
 
@@ -607,7 +907,7 @@ def _unpack_extended_response(
                 name = reader.read_octet_string(
                     header=next_header,
                     hint="ExtendedResponse.responseName",
-                ).decode("utf-8")
+                ).decode(reader.string_encoding)
                 continue
 
             elif next_header.tag.tag_number == 11:
@@ -630,6 +930,16 @@ def _unpack_extended_response(
 
 @dataclasses.dataclass
 class SimpleCredential:
+    """The Simple Credential.
+
+    This object is used to encode the simple password for a
+    :class:`BindRequest`.
+
+    Args:
+        password: The password to authenticate with or an empty string for an
+            identity only, or anonymous, bind operation.
+    """
+
     authentication_id: int = dataclasses.field(init=False, repr=False, default=0)
 
     password: str
@@ -639,13 +949,32 @@ class SimpleCredential:
         writer: ASN1Writer,
     ) -> None:
         writer.write_octet_string(
-            self.password.encode("utf-8"),
+            self.password.encode(writer.string_encoding),
             ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.authentication_id, False),
         )
 
 
 @dataclasses.dataclass
 class SaslCredential:
+    """The SASL Credential.
+
+    This object is used to store the SASL credential for a
+    :class:`BindRequest`. It contains the SASL mechanism used and the
+    credential byte string for that credential. The SaslCredentials structure
+    is defined in `RFC 4511 4.2 Bind Operation`_.
+
+    Args:
+        mechanism: The SASL mechanism.
+        credentials: The SASL credential bytes to exchange, if any.
+
+    .. _RFC 4511 4.2. Bind Operation:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.2
+    """
+
+    # SaslCredentials ::= SEQUENCE {
+    #      mechanism               LDAPString,
+    #      credentials             OCTET STRING OPTIONAL }
+
     authentication_id: int = dataclasses.field(init=False, repr=False, default=3)
 
     mechanism: str
@@ -658,13 +987,92 @@ class SaslCredential:
         with writer.push_sequence(
             ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.authentication_id, True),
         ) as sasl_writer:
-            sasl_writer.write_octet_string(self.mechanism.encode("utf-8"))
+            sasl_writer.write_octet_string(self.mechanism.encode(writer.string_encoding))
             if self.credentials is not None:
                 sasl_writer.write_octet_string(self.credentials)
 
 
 @dataclasses.dataclass
 class LDAPResult:
+    """The LDAPResult message.
+
+    This is the base object that contains the various response results from a
+    server. The LDAPResult structure is defined in
+    `RFC 4511 4.1.9. Result Message`_.
+
+    Args:
+        result_code: The result status of the operation.
+        matched_dn: The subject to the name of the last entry used in finding
+            the target of base object. Can be an empty string if not relevant.
+        diagnostics_message: A string containing textual diagnostic messages.
+            This is not standardized and should not be parsed, used for display
+            purposes.
+        referrals: Used when the result_code is ``REFERRAL``, contains the
+            references to one or more servers/services that may be accessed by
+            LDAP.
+
+    .. _RFC 4511 4.1.9. Result Message
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.1.9
+    """
+
+    # LDAPResult ::= SEQUENCE {
+    #      resultCode         ENUMERATED {
+    #           success                      (0),
+    #           operationsError              (1),
+    #           protocolError                (2),
+    #           timeLimitExceeded            (3),
+    #           sizeLimitExceeded            (4),
+    #           compareFalse                 (5),
+    #           compareTrue                  (6),
+    #           authMethodNotSupported       (7),
+    #           strongerAuthRequired         (8),
+    #                -- 9 reserved --
+    #           referral                     (10),
+    #           adminLimitExceeded           (11),
+    #           unavailableCriticalExtension (12),
+    #           confidentialityRequired      (13),
+    #           saslBindInProgress           (14),
+    #           noSuchAttribute              (16),
+    #           undefinedAttributeType       (17),
+    #           inappropriateMatching        (18),
+    #           constraintViolation          (19),
+    #           attributeOrValueExists       (20),
+    #           invalidAttributeSyntax       (21),
+    #                -- 22-31 unused --
+    #           noSuchObject                 (32),
+    #           aliasProblem                 (33),
+    #           invalidDNSyntax              (34),
+    #                -- 35 reserved for undefined isLeaf --
+    #           aliasDereferencingProblem    (36),
+    #                -- 37-47 unused --
+    #           inappropriateAuthentication  (48),
+    #           invalidCredentials           (49),
+    #           insufficientAccessRights     (50),
+    #           busy                         (51),
+    #           unavailable                  (52),
+    #           unwillingToPerform           (53),
+    #           loopDetect                   (54),
+    #                -- 55-63 unused --
+    #           namingViolation              (64),
+    #           objectClassViolation         (65),
+    #           notAllowedOnNonLeaf          (66),
+    #           notAllowedOnRDN              (67),
+    #           entryAlreadyExists           (68),
+    #           objectClassModsProhibited    (69),
+    #                -- 70 reserved for CLDAP --
+    #           affectsMultipleDSAs          (71),
+    #                -- 72-79 unused --
+    #           other                        (80),
+    #           ...  },
+    #      matchedDN          LDAPDN,
+    #      diagnosticMessage  LDAPString,
+    #      referral           [3] Referral OPTIONAL }
+    #
+    # Referral ::= SEQUENCE SIZE (1..MAX) OF uri URI
+    #
+    # URI ::= LDAPString     -- limited to characters permitted in
+    #                        -- URIs
+
     result_code: LDAPResultCode
     matched_dn: str
     diagnostics_message: str
@@ -675,13 +1083,13 @@ class LDAPResult:
         writer: ASN1Writer,
     ) -> None:
         writer.write_enumerated(self.result_code.value)
-        writer.write_octet_string(self.matched_dn.encode("utf-8"))
-        writer.write_octet_string(self.diagnostics_message.encode("utf-8"))
+        writer.write_octet_string(self.matched_dn.encode(writer.string_encoding))
+        writer.write_octet_string(self.diagnostics_message.encode(writer.string_encoding))
 
         if self.referrals is not None:
             with writer.push_sequence(ASN1Tag(TagClass.CONTEXT_SPECIFIC, 3, True)) as referrals:
                 for r in self.referrals:
-                    referrals.write_octet_string(r.encode("utf-8"))
+                    referrals.write_octet_string(r.encode(writer.string_encoding))
 
 
 def _unpack_ldap_result(
@@ -693,11 +1101,11 @@ def _unpack_ldap_result(
     )
     matched_dn = reader.read_octet_string(
         hint="LDAPResult.matchedDN",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
 
     diagnostics_message = reader.read_octet_string(
         hint="LDAPResult.diagnosticMessage",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
 
     referrals: t.Optional[t.List[str]] = None
     if reader:
@@ -713,7 +1121,7 @@ def _unpack_ldap_result(
             while referral_reader:
                 r = referral_reader.read_octet_string(
                     hint="LDAPResult.referral",
-                ).decode("utf-8")
+                ).decode(reader.string_encoding)
                 referrals.append(r)
 
     return LDAPResult(
@@ -726,6 +1134,26 @@ def _unpack_ldap_result(
 
 @dataclasses.dataclass
 class PartialAttribute:
+    """The PartialAttribute object.
+
+    This is the object that contains the attribute description/name and values.
+    The set of attribute values is unordered and implementations MUST NOT rely
+    upon the ordering being repeatable. The PartialAttribute structure is
+    defined in `RFC 4511 4.1.7. Attribute and PartialAttribute`_.
+
+    Args:
+        name: The attribute name.
+        values: The attribute values, this list may be empty if no values are
+            set.
+
+    .. _RFC 4511 4.1.7. Attribute and PartialAttribute:
+        https://www.rfc-editor.org/rfc/rfc4511#section-4.1.7
+    """
+
+    # PartialAttribute ::= SEQUENCE {
+    #      type       AttributeDescription,
+    #      vals       SET OF value AttributeValue }
+
     name: str
     values: t.List[bytes]
 
@@ -734,7 +1162,7 @@ class PartialAttribute:
         writer: ASN1Writer,
     ) -> None:
         with writer.push_sequence() as val:
-            val.write_octet_string(self.name.encode("utf-8"))
+            val.write_octet_string(self.name.encode(writer.string_encoding))
 
             with val.push_set_of() as values:
                 for v in self.values:
@@ -748,7 +1176,7 @@ def _unpack_partial_attribute(
 
     name = attr_reader.read_octet_string(
         hint="PartialAttribute.type",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
 
     values: t.List[bytes] = []
     value_reader = attr_reader.read_set(hint="PartialAttribute.vals")

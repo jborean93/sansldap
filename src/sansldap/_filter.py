@@ -12,6 +12,17 @@ from ._asn1 import ASN1Header, ASN1Reader, ASN1Tag, ASN1Writer, TagClass
 def unpack_ldap_filter(
     reader: ASN1Reader,
 ) -> LDAPFilter:
+    """Unpack an LDAP filter.
+
+    Unpacks the raw ASN.1 value in the reader specified into an LDAP filter
+    object.
+
+    Args:
+        reader: The ASN.1 reader to read from.
+
+    Returns:
+        LDAPFilter: The unpacked LDAP filter object.
+    """
     choice = reader.peek_header()
 
     unpack_func = FILTER_UNPACKER.get(choice.tag.tag_number, None)
@@ -23,6 +34,36 @@ def unpack_ldap_filter(
 
 @dataclasses.dataclass
 class LDAPFilter:
+    """Base class for all LDAP filters.
+
+    This is the base class in which all LDAP filters derive. It cannot be used
+    directly. Currently the following filter types are known:
+
+        :class:`FilterAnd`
+        :class:`FilterOr`
+        :class:`FilterNoe`
+        :class:`FilterEquality`
+        :class:`FilterSubstrings`
+        :class:`FilterGreaterOrEqual`
+        :class:`FilterLessOrEqual`
+        :class:`FilterPresent`
+        :class:`FilterApproxMatch`
+        :class:`FilterExtensibleMatch`
+    """
+
+    # Filter ::= CHOICE {
+    #      and             [0] SET SIZE (1..MAX) OF filter Filter,
+    #      or              [1] SET SIZE (1..MAX) OF filter Filter,
+    #      not             [2] Filter,
+    #      equalityMatch   [3] AttributeValueAssertion,
+    #      substrings      [4] SubstringFilter,
+    #      greaterOrEqual  [5] AttributeValueAssertion,
+    #      lessOrEqual     [6] AttributeValueAssertion,
+    #      present         [7] AttributeDescription,
+    #      approxMatch     [8] AttributeValueAssertion,
+    #      extensibleMatch [9] MatchingRuleAssertion,
+    #      ...  }
+
     filter_id: int
 
     def _pack_internal(
@@ -34,6 +75,17 @@ class LDAPFilter:
 
 @dataclasses.dataclass
 class FilterAnd(LDAPFilter):
+    """LDAP Filter Any.
+
+    An LDAP filter that is used to combine multiple filters together using the
+    AND logic operation. All filters specified must be true for this filter to
+    be true in a search operation. An AND LDAP filter string look like
+    ``(&(condition=1)(condition=2)...)``
+
+    Args:
+        filters: The filters to use in the AND operation.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=0)
 
     filters: t.List[LDAPFilter]
@@ -64,6 +116,17 @@ def _unpack_filter_and(
 
 @dataclasses.dataclass
 class FilterOr(LDAPFilter):
+    """LDAP Filter Or.
+
+    An LDAP filter that is used to combine multiple filters together using the
+    OR logic operation. Only one of the filters specified must be true for this
+    filter to be true in a search operation. An OR LDAP filter string looks
+    like ``(|(condition=1)(condition=2)...)``
+
+    Args:
+        filters: The filters to use in the OR operation.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=1)
 
     filters: t.List[LDAPFilter]
@@ -94,6 +157,17 @@ def _unpack_filter_or(
 
 @dataclasses.dataclass
 class FilterNot(LDAPFilter):
+    """LDAP Filter Not.
+
+    An LDAP filter that is used to inverse the logic of the filter present. For
+    example if the filter condition is false, then the NOT filter will make it
+    true and vice versa. A NOT LDAP filter string looks like
+    ``(!(attribute=1))``.
+
+    Args:
+        filter: The filter to inverse.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=2)
 
     filter: LDAPFilter
@@ -120,6 +194,17 @@ def _unpack_filter_not(
 
 @dataclasses.dataclass
 class FilterEquality(LDAPFilter):
+    """LDAP Filter Equality.
+
+    An LDAP filter that is used to check if the attribtue specified is set to
+    the value specified. An equality LDAP filter string looks like
+    ``(attribute=1)``.
+
+    Args:
+        attribute: The attribute to match against.
+        value: The value of the attribute to check.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=3)
 
     attribute: str
@@ -132,7 +217,7 @@ class FilterEquality(LDAPFilter):
         with writer.push_sequence(
             ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, True),
         ) as w:
-            w.write_octet_string(self.attribute.encode("utf-8"))
+            w.write_octet_string(self.attribute.encode(writer.string_encoding))
             w.write_octet_string(self.value)
 
 
@@ -150,6 +235,21 @@ def _unpack_filter_equality(
 
 @dataclasses.dataclass
 class FilterSubstrings(LDAPFilter):
+    """LDAP Filter Substrings.
+
+    An LDAP filter that is used to check substrings inside an attribute value.
+    It can contain an initial and final string that must match the start and
+    end of the value respectively. It can also contain any values in the middle
+    of the value as denoted by the any argument. A substrings LDAP filter looks
+    like ``(attribute=initial*any 1*any 2*final)``.
+
+    Args:
+        attribute: The attribute to match against.
+        initial: The value must start with this value if present.
+        any: Values inside the whole value that are checked to be in the value.
+        final: The value must end with this value if present.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=4)
 
     attribute: str
@@ -164,7 +264,7 @@ class FilterSubstrings(LDAPFilter):
         with writer.push_sequence(
             ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, True),
         ) as w:
-            w.write_octet_string(self.attribute.encode("utf-8"))
+            w.write_octet_string(self.attribute.encode(writer.string_encoding))
 
             with writer.push_sequence_of() as value_writer:
                 if self.initial is not None:
@@ -197,7 +297,7 @@ def _unpack_filter_substrings(
 
     attribute = filter_reader.read_octet_string(
         hint="Filter.substrings.type",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
 
     substrings_reader = filter_reader.read_sequence_of(
         hint="Filter.substrings.substrings",
@@ -248,6 +348,17 @@ def _unpack_filter_substrings(
 
 @dataclasses.dataclass
 class FilterGreaterOrEqual(LDAPFilter):
+    """LDAP Filter Greater Than.
+
+    An LDAP filter that is used to great if the value is greater than or equal
+    to the value specified. A greater than or equal LDAP filter looks like
+    ``(attribute>=1)``.
+
+    Args:
+        attribute: The attribute to match against.
+        value: The value that must be greater or equal to the actual value.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=5)
 
     attribute: str
@@ -260,7 +371,7 @@ class FilterGreaterOrEqual(LDAPFilter):
         with writer.push_sequence(
             ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, True),
         ) as w:
-            w.write_octet_string(self.attribute.encode("utf-8"))
+            w.write_octet_string(self.attribute.encode(writer.string_encoding))
             w.write_octet_string(self.value)
 
 
@@ -278,6 +389,17 @@ def _unpack_filter_greater_or_equal(
 
 @dataclasses.dataclass
 class FilterLessOrEqual(LDAPFilter):
+    """LDAP Filter Less Than.
+
+    An LDAP filter that is used to great if the value is less than or equal
+    to the value specified. A less than or equal LDAP filter looks like
+    ``(attribute<=1)``.
+
+    Args:
+        attribute: The attribute to match against.
+        value: The value that must be lesser or equal to the actual value.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=6)
 
     attribute: str
@@ -290,7 +412,7 @@ class FilterLessOrEqual(LDAPFilter):
         with writer.push_sequence(
             ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, True),
         ) as w:
-            w.write_octet_string(self.attribute.encode("utf-8"))
+            w.write_octet_string(self.attribute.encode(writer.string_encoding))
             w.write_octet_string(self.value)
 
 
@@ -308,6 +430,16 @@ def _unpack_filter_less_or_equal(
 
 @dataclasses.dataclass
 class FilterPresent(LDAPFilter):
+    """LDAP Filter Present.
+
+    An LDAP filter that is used to great if the attribute is present (has a
+    value) in the entity being checked. A present LDAP filter looks like
+    ``(attribute=*)``.
+
+    Args:
+        attribute: The attribute to check if present.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=7)
 
     attribute: str
@@ -317,7 +449,7 @@ class FilterPresent(LDAPFilter):
         writer: ASN1Writer,
     ) -> None:
         writer.write_octet_string(
-            self.attribute.encode("utf-8"),
+            self.attribute.encode(writer.string_encoding),
             tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, False),
         )
 
@@ -329,13 +461,24 @@ def _unpack_filter_present(
     value = reader.read_octet_string(
         header=header,
         hint="Filter.present",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
 
     return FilterPresent(attribute=value)
 
 
 @dataclasses.dataclass
 class FilterApproxMatch(LDAPFilter):
+    """LDAP Filter Approx Match.
+
+    An LDAP filter that is used to check if the value for the attribute
+    specified matches a locally-defined approximate matching algorithm. An
+    approx match LDAP filter looks like ``(attribute~=condition)``.
+
+    Args:
+        attribute: The attribute to match against.
+        value: The value to use as the approximate matching comparison.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=8)
 
     attribute: str
@@ -348,7 +491,7 @@ class FilterApproxMatch(LDAPFilter):
         with writer.push_sequence(
             ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, True),
         ) as w:
-            w.write_octet_string(self.attribute.encode("utf-8"))
+            w.write_octet_string(self.attribute.encode(writer.string_encoding))
             w.write_octet_string(self.value)
 
 
@@ -366,6 +509,26 @@ def _unpack_filter_approx_match(
 
 @dataclasses.dataclass
 class FilterExtensibleMatch(LDAPFilter):
+    """LDAP Filter Extensible Match.
+
+    An LDAP filter that is used to as a more powerful way to check an attribute
+    value. It can have custom rules and logic that is known to the server for
+    the check. An extensible amtch LDAP filter looks like
+    ``(attribute:=John)``, ``(attribute:dn:=Jordan)``, or
+    ``(attribute:1.2.3:=John)``. If no rule is specified then attribute must be
+    set.
+
+    Args:
+        rule: The rule name or OID string that should be used for the match or
+            None if attribute is set to follow the normal rules.
+        attribute: The attribute to match against if this should only be
+            checked against a single value. Can be None to search all
+            attributes if rule is set.
+        value: The value to compare.
+        dn_attributes: Use the attributes that compose the entries DN in the
+            check.
+    """
+
     filter_id: int = dataclasses.field(init=False, repr=False, default=9)
 
     rule: t.Optional[str]
@@ -382,13 +545,13 @@ class FilterExtensibleMatch(LDAPFilter):
         ) as w:
             if self.rule is not None:
                 w.write_octet_string(
-                    self.rule.encode("utf-8"),
+                    self.rule.encode(writer.string_encoding),
                     tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, 1, False),
                 )
 
             if self.attribute is not None:
                 w.write_octet_string(
-                    self.attribute.encode("utf-8"),
+                    self.attribute.encode(writer.string_encoding),
                     tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, 2, False),
                 )
 
@@ -425,14 +588,14 @@ def _unpack_filter_extensible_match(
                 rule = filter_reader.read_octet_string(
                     header=next_header,
                     hint="Filter.extensibleMatch.matchingRule",
-                ).decode("utf-8")
+                ).decode(reader.string_encoding)
                 continue
 
             elif next_header.tag.tag_number == 2:
                 attribute = filter_reader.read_octet_string(
                     header=next_header,
                     hint="Filter.extensibleMatch.type",
-                ).decode("utf-8")
+                ).decode(reader.string_encoding)
                 continue
 
             elif next_header.tag.tag_number == 3:
@@ -468,7 +631,7 @@ def _unpack_filter_attribute_value_assertion(
 
     attribute = filter_reader.read_octet_string(
         hint=f"Filter.{name}.attributeDesc",
-    ).decode("utf-8")
+    ).decode(reader.string_encoding)
     value = filter_reader.read_octet_string(
         hint=f"Filter.{name}.assertionValue",
     )

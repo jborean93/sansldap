@@ -3,4 +3,5 @@ isort==5.11.4
 mypy==0.991
 pre-commit
 pytest
+pytest-asyncio
 pytest-cov

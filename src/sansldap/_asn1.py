@@ -103,7 +103,10 @@ class ASN1Reader:
     def __init__(
         self,
         data: t.Union[bytes, bytearray, memoryview],
+        *,
+        string_encoding: str = "utf-8",
     ) -> None:
+        self.string_encoding = string_encoding
         self._data = data
         self._view = memoryview(self._data)
 
@@ -118,6 +121,11 @@ class ASN1Reader:
         header: ASN1Header,
     ) -> None:
         self._value = self._view[header.tag_length + header.length :]
+
+    def get_remaining_data(self) -> bytes:
+        data = self._view.tobytes()
+        self._view = memoryview(b"")
+        return data
 
     def read_boolean(
         self,
@@ -198,7 +206,7 @@ class ASN1Reader:
         )
         self._view = self._view[consumed:]
 
-        return ASN1Reader(new_view)
+        return ASN1Reader(new_view, string_encoding=self.string_encoding)
 
     read_set_of = read_set
 
@@ -216,7 +224,7 @@ class ASN1Reader:
         )
         self._view = self._view[consumed:]
 
-        return ASN1Reader(new_view)
+        return ASN1Reader(new_view, string_encoding=self.string_encoding)
 
     read_sequence_of = read_sequence
 
@@ -225,9 +233,11 @@ class ASN1Writer:
     def __init__(
         self,
         *,
+        string_encoding: str = "utf-8",
         tag: t.Optional[ASN1Tag] = None,
         parent: t.Optional[ASN1Writer] = None,
     ) -> None:
+        self.string_encoding = string_encoding
         self._data = bytearray()
         self._tag = tag
         self._parent = parent
@@ -258,7 +268,7 @@ class ASN1Writer:
     ) -> ASN1Writer:
         if not tag:
             tag = ASN1Tag.universal_tag(TypeTagNumber.SEQUENCE, is_constructed=True)
-        return ASN1Writer(tag=tag, parent=self)
+        return ASN1Writer(tag=tag, parent=self, string_encoding=self.string_encoding)
 
     push_sequence_of = push_sequence
 
@@ -268,7 +278,7 @@ class ASN1Writer:
     ) -> ASN1Writer:
         if not tag:
             tag = ASN1Tag.universal_tag(TypeTagNumber.SET, is_constructed=True)
-        return ASN1Writer(tag=tag, parent=self)
+        return ASN1Writer(tag=tag, parent=self, string_encoding=self.string_encoding)
 
     push_set_of = push_set
 

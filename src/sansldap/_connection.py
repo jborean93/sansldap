@@ -4,7 +4,7 @@
 import enum
 import typing as t
 
-from ._asn1 import NotEnougData
+from ._asn1 import ASN1Reader, NotEnougData
 from ._controls import LDAPControl
 from ._filter import LDAPFilter
 from ._messages import (
@@ -20,6 +20,7 @@ from ._messages import (
     SearchScope,
     SimpleCredential,
     UnbindRequest,
+    unpack_ldap_message,
 )
 
 
@@ -104,30 +105,35 @@ class LDAPConnection:
         try:
             if self._incoming_buffer:
                 self._incoming_buffer.extend(data)
-                while self._incoming_buffer:
+                reader = ASN1Reader(self._incoming_buffer)
+                while reader:
                     try:
-                        msg, consumed = LDAPMessage.unpack(self._incoming_buffer)
+                        msg = unpack_ldap_message(reader)
                     except NotEnougData:
                         break
 
-                    self._incoming_buffer = self._incoming_buffer[consumed:]
                     self._add_incoming_message(msg)
+
+                self._incoming_buffer = bytearray(reader.get_remaining_data())
 
             else:
-                view = memoryview(data)
+                reader = ASN1Reader(data)
 
-                while view:
+                while reader:
                     try:
-                        msg, consumed = LDAPMessage.unpack(view)
+                        msg = unpack_ldap_message(reader)
                     except NotEnougData:
-                        self._incoming_buffer.extend(view)
+                        self._incoming_buffer = bytearray(reader.get_remaining_data())
                         break
 
-                    view = view[consumed:]
                     self._add_incoming_message(msg)
+
         except (ValueError, NotImplementedError) as e:
-            # FIXME: Unbind or some other request here?
             raise ProtocolError(f"Received invalid data from the peer, connection closing: {e}") from e
+
+        except ProtocolError:
+            # FIXME: Unbind or some other request here?
+            raise
 
     def next_event(
         self,
@@ -170,17 +176,18 @@ class LDAPClient(LDAPConnection):
 
     def bind(
         self,
-        dn: str,
-        password: str,
+        dn: t.Optional[str] = None,
+        password: t.Optional[str] = None,
         controls: t.Optional[t.List[LDAPControl]] = None,
     ) -> int:
         msg = BindRequest(
             message_id=0,
             controls=controls or [],
             version=3,
-            name=dn,
-            authentication=SimpleCredential(password=password),
+            name=dn or "",
+            authentication=SimpleCredential(password=password or ""),
         )
+        self.state = SessionState.BINDING
         return self._send(msg)
 
     def sasl_bind(
@@ -254,7 +261,9 @@ class LDAPClient(LDAPConnection):
         msg: LDAPMessage,
     ) -> None:
         if msg.message_id not in self._outstanding_requests:
-            raise Exception("FIXME exc type: Received unexpected response")
+            raise ProtocolError(f"Received unexpected message id response {msg.message_id} from server")
+
+        self._outstanding_requests.remove(msg.message_id)
 
         return super()._add_incoming_message(msg)
 

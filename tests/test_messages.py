@@ -4,8 +4,14 @@
 import sansldap._controls as c
 import sansldap._filter as f
 import sansldap._messages as m
+from sansldap._asn1 import ASN1Reader
 
 from .conftest import get_test_data
+
+
+def unpack_message(data: bytes) -> m.LDAPMessage:
+    reader = ASN1Reader(data)
+    return m.unpack_ldap_message(reader)
 
 
 class TestBindRequest:
@@ -20,8 +26,7 @@ class TestBindRequest:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.BindRequest)
         assert unpacked.message_id == 2
         assert unpacked.controls == []
@@ -32,9 +37,8 @@ class TestBindRequest:
 
     def test_simple_parse(self) -> None:
         data = get_test_data("bind_request_simple")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.BindRequest)
         assert actual.message_id == 1
         assert actual.controls == []
@@ -57,8 +61,7 @@ class TestBindRequest:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.BindRequest)
         assert unpacked.message_id == 2
         assert unpacked.controls == []
@@ -70,9 +73,8 @@ class TestBindRequest:
 
     def test_sasl_parse(self) -> None:
         data = get_test_data("bind_request_sasl")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.BindRequest)
         assert actual.message_id == 1
         assert actual.controls == []
@@ -100,8 +102,7 @@ class TestBindResponse:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.BindResponse)
         assert unpacked.message_id == 2
         assert unpacked.controls == []
@@ -126,16 +127,14 @@ class TestBindResponse:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.BindResponse)
         assert unpacked.server_sasl_creds is None
 
     def test_parse(self) -> None:
         data = get_test_data("bind_response")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.BindResponse)
         assert actual.message_id == 1
         assert actual.controls == []
@@ -164,8 +163,7 @@ class TestSearchRequest:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.SearchRequest)
         assert unpacked.message_id == 2
         assert unpacked.controls == []
@@ -181,9 +179,8 @@ class TestSearchRequest:
 
     def test_parse(self) -> None:
         data = get_test_data("search_request")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.SearchRequest)
         assert actual.message_id == 2
         assert len(actual.controls) == 1
@@ -223,8 +220,7 @@ class TestSearchResultEntry:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.SearchResultEntry)
         assert unpacked.message_id == 2
         assert unpacked.controls == []
@@ -245,9 +241,8 @@ class TestSearchResultEntry:
 
     def test_parse(self) -> None:
         data = get_test_data("search_result_entry")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.SearchResultEntry)
         assert actual.message_id == 2
         assert actual.controls == []
@@ -286,8 +281,7 @@ class TestSearchResultDone:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.SearchResultDone)
         assert unpacked.message_id == 2
         assert unpacked.controls == []
@@ -310,8 +304,7 @@ class TestSearchResultDone:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.SearchResultDone)
         assert unpacked.message_id == 2
         assert len(unpacked.controls) == 1
@@ -342,8 +335,7 @@ class TestSearchResultDone:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.SearchResultDone)
         assert unpacked.message_id == 2
         assert unpacked.controls == []
@@ -357,9 +349,8 @@ class TestSearchResultDone:
 
     def test_parse_with_control(self) -> None:
         data = get_test_data("search_result_done_control")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.SearchResultDone)
         assert actual.message_id == 13
         assert len(actual.controls) == 1
@@ -376,9 +367,8 @@ class TestSearchResultDone:
 
     def test_parse_with_referral(self) -> None:
         data = get_test_data("search_result_done_referral")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.SearchResultDone)
         assert actual.message_id == 4
         assert len(actual.controls) == 1
@@ -407,8 +397,7 @@ class TestExtendedRequest:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.ExtendedRequest)
         assert unpacked.message_id == 1
         assert unpacked.controls == []
@@ -425,8 +414,7 @@ class TestExtendedRequest:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.ExtendedRequest)
         assert unpacked.message_id == 1
         assert unpacked.controls == []
@@ -435,9 +423,8 @@ class TestExtendedRequest:
 
     def test_parse(self) -> None:
         data = get_test_data("extended_request")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.ExtendedRequest)
         assert actual.message_id == 1
         assert actual.name == "1.3.6.1.4.1.1466.20037"
@@ -461,8 +448,7 @@ class TestExtendedResponse:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.ExtendedResponse)
         assert unpacked.message_id == 1
         assert unpacked.controls == []
@@ -489,8 +475,7 @@ class TestExtendedResponse:
         actual = msg.pack()
         assert isinstance(actual, bytes)
 
-        unpacked, consumed = m.LDAPMessage.unpack(actual)
-        assert consumed == len(actual)
+        unpacked = unpack_message(actual)
         assert isinstance(unpacked, m.ExtendedResponse)
         assert unpacked.message_id == 1
         assert unpacked.controls == []
@@ -503,9 +488,8 @@ class TestExtendedResponse:
 
     def test_parse(self) -> None:
         data = get_test_data("extended_response")
-        actual, consumed = m.LDAPMessage.unpack(data)
+        actual = unpack_message(data)
 
-        assert len(data) == consumed
         assert isinstance(actual, m.ExtendedResponse)
         assert actual.message_id == 1
         assert actual.result.result_code == m.LDAPResultCode.SUCCESS
