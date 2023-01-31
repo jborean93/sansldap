@@ -1,13 +1,6 @@
 # Copyright: (c) 2023, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
-from ._connection import (
-    LDAPClient,
-    LDAPConnection,
-    LDAPServer,
-    ProtocolError,
-    SessionState,
-)
 from ._controls import (
     LDAPControl,
     PagedResultControl,
@@ -46,6 +39,15 @@ from ._messages import (
     SimpleCredential,
     UnbindRequest,
 )
+from ._session import (
+    LDAPClient,
+    LDAPError,
+    LDAPServer,
+    LDAPSession,
+    ProtocolError,
+    SessionState,
+    StateError,
+)
 
 __all__ = [
     "BindRequest",
@@ -64,8 +66,9 @@ __all__ = [
     "FilterPresent",
     "FilterSubstrings",
     "LDAPClient",
-    "LDAPConnection",
+    "LDAPSession",
     "LDAPControl",
+    "LDAPError",
     "LDAPFilter",
     "LDAPMessage",
     "LDAPResult",
@@ -84,5 +87,6 @@ __all__ = [
     "ShowDeactivatedLinkControl",
     "ShowDeletedControl",
     "SimpleCredential",
+    "StateError",
     "UnbindRequest",
 ]

@@ -89,12 +89,20 @@ class LDAPClient:
         username: t.Optional[str] = None,
         password: t.Optional[str] = None,
     ) -> None:
-        msg_id = self.protocol.bind(username, password)
+        msg_id = self.protocol.bind_simple(username, password)
         await self._send_and_wait(msg_id)
 
     async def _read_loop(self) -> None:
         while True:
-            resp = await self._reader.read(4096)
+            try:
+                resp = await self._reader.read(4096)
+            except Exception as e:
+                for awaiter in self._incoming_messages.values():
+                    awaiter.free(e)
+
+                self._incoming_messages = {}
+                break
+
             try:
                 self.protocol.receive(resp)
             except sansldap.ProtocolError as e:
