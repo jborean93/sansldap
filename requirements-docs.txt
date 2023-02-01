@@ -1,0 +1,5 @@
+myst-parser  # For parsing markdown docs instead of rst
+Sphinx
+sphinx-autodoc-typehints  # Include type hints in docs
+sphinx-rtd-theme  # Theme used
+sphinxcontrib-apidoc  # Automatically build API docs during sphinx build

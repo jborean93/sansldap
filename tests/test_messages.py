@@ -13,7 +13,6 @@ PACKING_OPTIONS = m.PackingOptions()
 
 
 def unpack_message(data: bytes) -> m.LDAPMessage:
-
     reader = ASN1Reader(data)
     return m.unpack_ldap_message(reader, PACKING_OPTIONS)
 

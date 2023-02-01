@@ -15,7 +15,7 @@ class FilterOptions:
 
     Custom options used for packing and unpacking filter objects.
 
-    Attributes:
+    Args:
         string_encoding: The encoding that is used to encode and decode
             strings. Defaults to utf-8.
         choices: List of known filter types.

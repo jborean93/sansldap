@@ -220,8 +220,6 @@ class LDAPMessage:
     Args:
         message_id: The unique identifier for the request.
         controls: A list of controls associated with the message.
-
-    Attributes:
         tag_number: The protocolOp choice for this message type. This is
             defined on each LDAPMessage sub class.
 
@@ -306,7 +304,7 @@ class BindRequest(LDAPMessage, Request):
 
     This object is used to exchange authentication and security-related
     semantics between the client and server. The BindRequest structure is
-    defined in `RFC 4511 4.2 Bind Operation`_.
+    defined in `RFC 4511 4.2. Bind Operation`_.
 
     Args:
         message_id: The unique identifier for the request.
@@ -335,6 +333,7 @@ class BindRequest(LDAPMessage, Request):
     #      ...  }
 
     tag_number = 0
+    "The LDAP message protocol op tag."
 
     version: int
     name: str
@@ -392,6 +391,7 @@ class BindResponse(LDAPMessage, Response):
     #      serverSaslCreds    [7] OCTET STRING OPTIONAL }
 
     tag_number = 1
+    "The LDAP message protocol op tag."
 
     result: LDAPResult
     server_sasl_creds: t.Optional[bytes] = None
@@ -457,6 +457,7 @@ class UnbindRequest(LDAPMessage, Request):
     """
 
     tag_number = 2
+    "The LDAP message protocol op tag."
 
     # UnbindRequest ::= [APPLICATION 2] NULL
 
@@ -526,6 +527,7 @@ class SearchRequest(LDAPMessage, Request):
     #      attributes      AttributeSelection }
 
     tag_number = 3
+    "The LDAP message protocol op tag."
 
     base_object: str
     scope: SearchScope
@@ -618,6 +620,7 @@ class SearchResultEntry(LDAPMessage, Response):
     #                      partialAttribute PartialAttribute
 
     tag_number = 4
+    "The LDAP message protocol op tag."
 
     object_name: str
     attributes: t.List[PartialAttribute]
@@ -686,6 +689,7 @@ class SearchResultDone(LDAPMessage, Response):
     # SearchResultDone ::= [APPLICATION 5] LDAPResult
 
     tag_number = 5
+    "The LDAP message protocol op tag."
 
     result: LDAPResult
 
@@ -736,6 +740,7 @@ class SearchResultReference(LDAPMessage, Response):
     #                           SIZE (1..MAX) OF uri URI
 
     tag_number = 19
+    "The LDAP message protocol op tag."
 
     uris: t.List[str]
 
@@ -795,6 +800,7 @@ class ExtendedRequest(LDAPMessage, Request):
     #      requestValue     [1] OCTET STRING OPTIONAL }
 
     tag_number = 23
+    "The LDAP message protocol op tag."
 
     name: str
     value: t.Optional[bytes]
@@ -884,6 +890,7 @@ class ExtendedResponse(LDAPMessage, Response):
     #      responseValue    [11] OCTET STRING OPTIONAL }
 
     tag_number = 24
+    "The LDAP message protocol op tag."
 
     result: LDAPResult
     name: t.Optional[str]
@@ -972,7 +979,7 @@ class LDAPResult:
             references to one or more servers/services that may be accessed by
             LDAP.
 
-    .. _RFC 4511 4.1.9. Result Message
+    .. _RFC 4511 4.1.9. Result Message:
         https://www.rfc-editor.org/rfc/rfc4511#section-4.1.9
     """
 

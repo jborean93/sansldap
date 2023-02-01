@@ -1,9 +1,16 @@
-include LICENSE
-include CHANGELOG.md
-include requirements-test.txt
 exclude .coverage
 exclude .gitignore
 exclude .pre-commit-config.yaml
+include .coveragerc
+include .readthedocs.yaml
+include LICENSE
+include CHANGELOG.md
+include requirements-*.txt
+
 recursive-include build_helpers *
 recursive-include tests *
 recursive-exclude tests *.pyc
+
+recursive-include docs *
+recursive-exclude docs/_build *
+recursive-exclude docs/source *

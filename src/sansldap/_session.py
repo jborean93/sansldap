@@ -487,14 +487,16 @@ class LDAPClient(LDAPSession):
 
         Creates a bind request with the authentication payload specified. This
         can be used to bind with a custom set of credentials that have been
-        registered with :func:`register_auth_ccredential`. it is recommended to
-        use :func:`bind_simple` or :func:`bind_sasl` instead of this function.
+        registered with :func:`LDAPSession.register_auth_credential`. it is
+        recommended to use :func:`bind_simple` or :func:`bind_sasl` instead of
+        this function.
 
         Args:
             dn: The name of the Directory object that the client wishes to bind
                 as.
             authentication: The authentication object to bind with. This must
-                be registered first with :func:`register_auth_credential`.
+                be registered first with
+                :func:`LDAPSession.register_auth_credential`.
             controls: Optional client controls to send with the request.
 
         Returns:
@@ -557,10 +559,10 @@ class LDAPClient(LDAPSession):
         """Send a Search Request.
 
         Creates a search request. This request can result in 3 different
-        responses from the server; `SearchResultEntry`, `SearchResultReferral`,
-        and `SearchResultDone`. The operation is not considered to be complete
-        until the `SearchResultDone` response has been received from the
-        server.
+        responses from the server; :class:`SearchResultEntry`,
+        :class:`SearchResultReference`, and :class:`SearchResultDone`. The
+        operation is not considered to be complete until the
+        :class:`SearchResultDone` response has been received from the server.
 
         While a limit can be placed for the size and time, these will be
         ignored by the server if their configured limits is less than what is

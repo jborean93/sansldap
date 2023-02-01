@@ -15,19 +15,22 @@ class AuthenticationOptions:
 
     Custom options used for packing and unpacking authentication objects.
 
-    Attributes:
+    Args:
         string_encoding: The encoding that is used to encode and decode
             strings. Defaults to utf-8.
         choices: List of known authentication types.
     """
 
     string_encoding: str = "utf-8"
+    "The encoding that is used to encode and decode string."
+
     choices: t.List[t.Type[AuthenticationCredential]] = dataclasses.field(
         default_factory=lambda: [
             SaslCredential,
             SimpleCredential,
         ]
     )
+    "List of known authentication types"
 
 
 @dataclasses.dataclass
@@ -35,7 +38,7 @@ class AuthenticationCredential:
     """Base class for Bind Request Authentication choices.
 
     This is the base class for bind request authentiction that can be used to
-    provide custom authentication choices used in the :class:`BindRequest`. By
+    provide custom authentication choices used in the :class:`sansldap.BindRequest`. By
     default the :class:`SimpleCredential` and :class:`SaslCredential` choices
     are available. Each implementation must provide a value for auth_id,
     is_primitive as well as implement the ``pack`` and ``unpack`` methods. If
@@ -66,13 +69,19 @@ class AuthenticationCredential:
                     username, password = data.decode(options.string_encoding).split(":")
                     return CustomAuthentication(username=username, password=password)
 
+    Args:
+        auth_id: The ASN.1 choice value for this credential.
+
     Note:
         A custom authentication credential must be understood by both the
         client and server.
     """
 
     auth_id: int
-    "The ASN.1 choice value for this credential."
+    """The authentication choice value.
+    Reflects the choice tag encoded in the ASN.1 value and should be set with a
+    default value in inheriting classes.
+    """
 
     def pack(
         self,
@@ -82,7 +91,7 @@ class AuthenticationCredential:
         """Pack the authentication structure.
 
         Writes the authentication structure into the ASN.1 writer that is then
-        embedded in the :class:`BindRequest` authentication value. The tagged
+        embedded in the :class:`sansldap.BindRequest` authentication value. The tagged
         choice should also be included in the written value.
 
         Args:
@@ -166,7 +175,7 @@ class SaslCredential(AuthenticationCredential):
     This object is used to store the SASL credential for a
     :class:`BindRequest`. It contains the SASL mechanism used and the
     credential byte string for that credential. The SaslCredentials structure
-    is defined in `RFC 4511 4.2 Bind Operation`_.
+    is defined in `RFC 4511 4.2. Bind Operation`_.
 
     Args:
         mechanism: The SASL mechanism.
@@ -181,10 +190,16 @@ class SaslCredential(AuthenticationCredential):
     #      credentials             OCTET STRING OPTIONAL }
 
     auth_id: int = dataclasses.field(init=False, repr=False, default=3)
+    "The authentication choice."
+
     is_primitive: bool = dataclasses.field(init=False, repr=False, default=False)
+    "The authentication choice value is not primitive."
 
     mechanism: str
+    "The SASL mechanism."
+
     credentials: t.Optional[bytes]
+    "The optional SASL credential bytes"
 
     def pack(
         self,

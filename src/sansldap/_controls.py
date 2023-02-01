@@ -69,7 +69,7 @@ class ControlOptions:
 
     Custom options used for packing and unpacking control objects.
 
-    Attributes:
+    Args:
         string_encoding: The encoding that is used to encode and decode
             strings. Defaults to utf-8.
         choices: List of known controls.
@@ -250,11 +250,6 @@ class PagedResultControl(_KnownControl):
             in a :class:`SearchRequest` message.
         cookie: An opaque set of bytes used to identify the search operation as
             denoted by the server response.
-
-    Attributes:
-        control_type: The control OID string.
-        value: Only set when the control was unpacked from an incoming message.
-            This is the raw control value.
 
     .. _RFC 2696 2. The Control:
         https://www.rfc-editor.org/rfc/rfc2696.html#section-2

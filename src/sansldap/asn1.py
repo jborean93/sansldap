@@ -82,8 +82,13 @@ class ASN1Tag(t.NamedTuple):
     """
 
     tag_class: TagClass
+    "The tag class."
+
     tag_number: t.Union[int, TypeTagNumber]
+    "The tag number, will be TypeTagNumber if the tag_class is UNIVERSAL."
+
     is_constructed: bool
+    "Whether the value is marked as constructed or primitive."
 
     @classmethod
     def universal_tag(
@@ -103,17 +108,22 @@ class ASN1Header(t.NamedTuple):
     """A representation of an ASN.1 TLV as a tuple.
 
     Defines the ASN.1 Type Length Value (TLV) values as separate objects for
-    easier parsing. This is returned by :method:`unpack_asn1`.
+    easier parsing. This is returned by :func:`ASN1Reader.peek_header`.
 
-    Attributes:
-        tag (ASN1Tag): The tag details, including the class and tag number.
-        tag_length (int): The length of the encoded tag.
-        length (int): The length of the value the tag represents.
+    Args:
+        tag: The tag details, including the class and tag number.
+        tag_length: The length of the encoded tag.
+        length: The length of the value the tag represents.
     """
 
     tag: ASN1Tag
+    "The ASN.1 tag details for the current entry."
+
     tag_length: int
+    "The length of the tag/length ASN.1 octets."
+
     length: int
+    "The length of the ASN.1 value."
 
 
 class ASN1Reader:
