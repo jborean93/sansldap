@@ -4,9 +4,14 @@
 import enum
 import typing as t
 
-from ._asn1 import ASN1Reader, NotEnougData
-from ._controls import LDAPControl
-from ._filter import LDAPFilter
+from ._authentication import (
+    AuthenticationCredential,
+    AuthenticationOptions,
+    SaslCredential,
+    SimpleCredential,
+)
+from ._controls import ControlOptions, LDAPControl
+from ._filter import FilterOptions, FilterPresent, LDAPFilter
 from ._messages import (
     BindRequest,
     BindResponse,
@@ -16,23 +21,26 @@ from ._messages import (
     LDAPMessage,
     LDAPResult,
     LDAPResultCode,
-    SaslCredential,
+    PackingOptions,
+    Request,
+    Response,
     SearchRequest,
     SearchScope,
-    SimpleCredential,
     UnbindRequest,
     unpack_ldap_message,
 )
+from .asn1 import ASN1Reader, NotEnougData
 
-LDAP_NOTICE_OF_DISCONNECTION = "1.3.6.1.4.1.1466.20036"
+
+class ExtendedOperations(enum.StrEnum):
+    """Known LDAP Extended Operation Names."""
+
+    LDAP_NOTICE_OF_DISCONNECTION = "1.3.6.1.4.1.1466.20036"
+    LDAP_START_TLS = "1.3.6.1.4.1.1466.20037"
 
 
 class LDAPError(Exception):
     """Base LDAP error class."""
-
-
-class StateError(LDAPError):
-    """LDAP session is not in the required state."""
 
 
 class ProtocolError(LDAPError):
@@ -40,20 +48,26 @@ class ProtocolError(LDAPError):
 
     An exception used to signal a fatal error during the LDAP session. It can
     be caused by trying to parse an invalid input message or from a Notice of
-    Disconnection error from the server. The caller should immediately close
-    the underlying connection upon receiving this error.
+    Disconnection error from the server. The caller should send the response,
+    if present, to the peer and then close the underlying connection upon
+    receiving this error.
 
     Args:
-        result: The LDAPResult if present that may contain more details.
+        request: The incoming message that caused the protocol error, or None
+            if the incoming data could not be unpacked.
+        response: Optional message to send to the peer to notify of it being
+            disconnected.
     """
 
     def __init__(
         self,
         msg: str,
-        result: t.Optional[LDAPResult] = None,
+        request: t.Optional[LDAPMessage] = None,
+        response: t.Optional[bytes] = None,
     ) -> None:
         super().__init__(msg)
-        self.result = result
+        self.request = request
+        self.response = response
 
 
 class SessionState(enum.Enum):
@@ -63,10 +77,10 @@ class SessionState(enum.Enum):
     "The session has not been opened and no messages were created or received."
 
     BINDING = enum.auto()
-    "The session is currently being bound."
+    "The session is currently going through a binding operation."
 
     OPENED = enum.auto()
-    "The session is opened and ready for additional requests."
+    "The session has been opened and a message sent or received."
 
     CLOSED = enum.auto()
     "The session has been closed either from an Unbind or ProtocolError."
@@ -77,7 +91,16 @@ class LDAPSession:
         self.state = SessionState.BEFORE_OPEN
         self.version = 3
 
+        string_encoding = "utf-8"
+
         self._outgoing_buffer = bytearray()
+        self._outstanding_requests: t.Set[int] = set()
+        self._packing_options = PackingOptions(
+            string_encoding=string_encoding,
+            authentication=AuthenticationOptions(string_encoding=string_encoding),
+            control=ControlOptions(string_encoding=string_encoding),
+            filter=FilterOptions(string_encoding=string_encoding),
+        )
         self._incoming_buffer = bytearray()
         self._incoming_msgs: t.Dict[int, LDAPMessage] = {}
 
@@ -142,7 +165,7 @@ class LDAPSession:
                 reader = ASN1Reader(self._incoming_buffer)
                 while reader:
                     try:
-                        msg = unpack_ldap_message(reader)
+                        msg = unpack_ldap_message(reader, self._packing_options)
                     except NotEnougData:
                         break
 
@@ -155,7 +178,7 @@ class LDAPSession:
 
                 while reader:
                     try:
-                        msg = unpack_ldap_message(reader)
+                        msg = unpack_ldap_message(reader, self._packing_options)
                     except NotEnougData:
                         self._incoming_buffer = bytearray(reader.get_remaining_data())
                         break
@@ -164,15 +187,17 @@ class LDAPSession:
 
             for msg in incoming_msgs:
                 # Check to see if the msg is a NoticeOfDisconnect
-                if isinstance(msg, ExtendedResponse) and msg.name == LDAP_NOTICE_OF_DISCONNECTION:
-                    self.state = SessionState.CLOSED
+                if (
+                    isinstance(msg, ExtendedResponse)
+                    and msg.name == ExtendedOperations.LDAP_NOTICE_OF_DISCONNECTION.value
+                ):
                     error_msg = f"Peer has sent a NoticeOfDisconnect response {msg.result.result_code.name}"
                     if msg.result.diagnostics_message:
                         error_msg += f": {msg.result.diagnostics_message}"
-                    raise ProtocolError(error_msg, result=msg.result)
+                    raise ProtocolError(error_msg, request=msg)
 
                 elif isinstance(msg, UnbindRequest):
-                    self.state = SessionState.CLOSED
+                    raise ProtocolError("Received unbind request, connection is closed", request=msg)
 
                 self._add_incoming_message(msg)
 
@@ -180,6 +205,8 @@ class LDAPSession:
             raise ProtocolError(f"Received invalid data from the peer, connection closing: {e}") from e
 
         except ProtocolError:
+            self.state = SessionState.CLOSED
+            self._outstanding_requests = set()
             raise
 
     def next_event(
@@ -208,6 +235,15 @@ class LDAPSession:
 
         return None
 
+    def register_auth_choice(self, choice: t.Type[AuthenticationCredential]) -> None:
+        self._packing_options.authentication.choices.append(choice)
+
+    def register_control(self, control: t.Type[LDAPControl]) -> None:
+        self._packing_options.control.choices.append(control)
+
+    def register_filter_choice(self, filter: t.Type[LDAPFilter]) -> None:
+        self._packing_options.filter.choices.append(filter)
+
     def unbind(self) -> None:
         """Send an unbind request.
 
@@ -221,6 +257,7 @@ class LDAPSession:
             controls=[],
         )
         self._send(msg)
+        self._outstanding_requests = set()
         self.state = SessionState.CLOSED
 
     def _add_incoming_message(
@@ -234,9 +271,17 @@ class LDAPSession:
         msg: LDAPMessage,
     ) -> int:
         if self.state == SessionState.CLOSED:
-            raise StateError("LDAP session is CLOSED, cannot send any new messages.")
+            raise LDAPError("LDAP session is CLOSED, cannot send any new messages.")
 
-        self._outgoing_buffer.extend(msg.pack())
+        elif self.state == SessionState.BINDING and not isinstance(msg, (UnbindRequest, BindRequest, BindResponse)):
+            raise LDAPError(
+                f"LDAP session is BINDING, can only send a BindRequest, BindResponse, or UnbindRequest not {type(msg).__name__}"
+            )
+
+        elif self.state == SessionState.BEFORE_OPEN:
+            self.state = SessionState.OPENED
+
+        self._outgoing_buffer.extend(msg.pack(self._packing_options))
 
         return msg.message_id
 
@@ -244,7 +289,6 @@ class LDAPSession:
 class LDAPClient(LDAPSession):
     def __init__(self) -> None:
         super().__init__()
-        self._outstanding_requests: t.Set[int] = set()
         self._message_counter = 1
 
     def bind_simple(
@@ -253,7 +297,7 @@ class LDAPClient(LDAPSession):
         password: t.Optional[str] = None,
         controls: t.Optional[t.List[LDAPControl]] = None,
     ) -> int:
-        return self._bind(
+        return self.bind(
             dn or "",
             authentication=SimpleCredential(password=password or ""),
             controls=controls,
@@ -261,13 +305,13 @@ class LDAPClient(LDAPSession):
 
     def bind_sasl(
         self,
-        dn: str,
         mechanism: str,
-        cred: bytes,
+        dn: t.Optional[str] = None,
+        cred: t.Optional[bytes] = None,
         controls: t.Optional[t.List[LDAPControl]] = None,
     ) -> int:
-        return self._bind(
-            dn,
+        return self.bind(
+            dn or "",
             authentication=SaslCredential(
                 mechanism=mechanism,
                 credentials=cred,
@@ -275,14 +319,14 @@ class LDAPClient(LDAPSession):
             controls=controls,
         )
 
-    def _bind(
+    def bind(
         self,
         dn: str,
-        authentication: t.Union[SimpleCredential, SaslCredential],
+        authentication: AuthenticationCredential,
         controls: t.Optional[t.List[LDAPControl]] = None,
     ) -> int:
         if self._outstanding_requests:
-            raise StateError("All outstanding requests must be completed to send a BindRequest")
+            raise LDAPError("All outstanding requests must be completed to send a BindRequest")
 
         msg = BindRequest(
             message_id=0,
@@ -292,9 +336,8 @@ class LDAPClient(LDAPSession):
             authentication=authentication,
         )
 
-        msg_id = self._send(msg)
         self.state = SessionState.BINDING
-        return msg_id
+        return self._send(msg)
 
     def extended_request(
         self,
@@ -302,9 +345,6 @@ class LDAPClient(LDAPSession):
         value: t.Optional[bytes] = None,
         controls: t.Optional[t.List[LDAPControl]] = None,
     ) -> int:
-        if self.state == SessionState.BINDING:
-            raise StateError("Cannot send an ExtendedRequest while the session is BINDING")
-
         msg = ExtendedRequest(
             message_id=0,
             controls=controls or [],
@@ -315,41 +355,63 @@ class LDAPClient(LDAPSession):
 
     def search_request(
         self,
-        base_object: str,
-        scope: t.Union[int, SearchScope],
-        dereferencing_policy: t.Union[int, DereferencingPolicy],
-        size_limit: int,
-        time_limit: int,
-        types_only: bool,
-        filter: LDAPFilter,
-        attributes: t.List[str],
+        base_object: t.Optional[str] = None,
+        scope: t.Union[int, SearchScope] = SearchScope.SUBTREE,
+        dereferencing_policy: t.Union[int, DereferencingPolicy] = DereferencingPolicy.NEVER,
+        size_limit: int = 0,
+        time_limit: int = 0,
+        types_only: bool = False,
+        filter: t.Optional[LDAPFilter] = None,
+        attributes: t.Optional[t.List[str]] = None,
         controls: t.Optional[t.List[LDAPControl]] = None,
     ) -> int:
-        if self.state != SessionState.OPENED:
-            raise StateError(f"Cannot send a SearchRequest while the session is {self.state.name} and not OPENED")
-
         msg = SearchRequest(
             message_id=0,
             controls=controls or [],
-            base_object=base_object,
+            base_object=base_object or "",
             scope=SearchScope(scope),
             deref_aliases=DereferencingPolicy(dereferencing_policy),
             size_limit=size_limit,
             time_limit=time_limit,
             types_only=types_only,
-            filter=filter,
-            attributes=attributes,
+            filter=filter or FilterPresent("objectClass"),
+            attributes=attributes or [],
         )
         return self._send(msg)
+
+    def receive(
+        self,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> None:
+        try:
+            return super().receive(data)
+        except ProtocolError as e:
+            if e.request is None or (
+                not isinstance(e.request, UnbindRequest)
+                and not (
+                    isinstance(e.request, ExtendedResponse)
+                    and e.request.name == ExtendedOperations.LDAP_NOTICE_OF_DISCONNECTION.name
+                )
+            ):
+                msg = UnbindRequest(
+                    message_id=0,
+                    controls=[],
+                )
+                e.response = msg.pack(self._packing_options)
+
+            raise
 
     def _add_incoming_message(
         self,
         msg: LDAPMessage,
     ) -> None:
-        if msg.message_id not in self._outstanding_requests:
+        if not isinstance(msg, Response):
+            raise ProtocolError(f"Received an LDAP message that is not a response {type(msg).__name__}, cannot process")
+
+        elif msg.message_id not in self._outstanding_requests:
             raise ProtocolError(f"Received unexpected message id response {msg.message_id} from server")
 
-        elif isinstance(msg, BindResponse) and msg.result.result_code == LDAPResultCode.SUCCESS:
+        if isinstance(msg, BindResponse) and msg.result.result_code == LDAPResultCode.SUCCESS:
             self.state = SessionState.OPENED
 
         self._outstanding_requests.remove(msg.message_id)
@@ -360,12 +422,18 @@ class LDAPClient(LDAPSession):
         self,
         msg: LDAPMessage,
     ) -> int:
+        if isinstance(msg, UnbindRequest):
+            return super()._send(msg)
+
         msg_id = self._message_counter
-        self._message_counter += 1
         msg.message_id = msg_id
+
+        super()._send(msg)
+
+        self._message_counter += 1
         self._outstanding_requests.add(msg_id)
 
-        return super()._send(msg)
+        return msg_id
 
 
 class LDAPServer(LDAPSession):
@@ -427,14 +495,20 @@ class LDAPServer(LDAPSession):
         try:
             return super().receive(data)
         except ProtocolError as e:
-            if self.state != SessionState.CLOSED:
-                self.extended_response(
+            if e.request is None or not isinstance(e.request, UnbindRequest):
+                msg = ExtendedResponse(
                     message_id=0,
-                    result_code=LDAPResultCode.PROTOCOL_ERROR,
-                    diagnostics_message=str(e),
-                    name=LDAP_NOTICE_OF_DISCONNECTION,
+                    controls=[],
+                    result=LDAPResult(
+                        result_code=LDAPResultCode.PROTOCOL_ERROR,
+                        matched_dn="",
+                        diagnostics_message=str(e),
+                        referrals=None,
+                    ),
+                    name=ExtendedOperations.LDAP_NOTICE_OF_DISCONNECTION.value,
+                    value=None,
                 )
-                self.state = SessionState.CLOSED
+                e.response = msg.pack(self._packing_options)
 
             raise
 
@@ -442,7 +516,31 @@ class LDAPServer(LDAPSession):
         self,
         msg: LDAPMessage,
     ) -> None:
+        if not isinstance(msg, Request):
+            raise ProtocolError(f"Received an LDAP message that is not a request {type(msg).__name__}, cannot process")
+
         if isinstance(msg, BindRequest):
+            if self._outstanding_requests:
+                raise ProtocolError("Received an LDAP bind request but server still has outstanding operations")
+
             self.state = SessionState.BINDING
 
+        elif self.state == SessionState.BEFORE_OPEN:
+            self.state = SessionState.OPENED
+
+        self._outstanding_requests.add(msg.message_id)
         super()._add_incoming_message(msg)
+
+    def _send(
+        self,
+        msg: LDAPMessage,
+    ) -> int:
+        msg_id = super()._send(msg)
+
+        if not isinstance(msg, UnbindRequest):
+            if msg_id in self._outstanding_requests:
+                self._outstanding_requests.remove(msg_id)
+            else:
+                raise LDAPError(f"Message {msg} is a response to an unknown request")
+
+        return msg_id

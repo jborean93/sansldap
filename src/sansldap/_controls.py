@@ -6,11 +6,12 @@ from __future__ import annotations
 import dataclasses
 import typing as t
 
-from ._asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass, TypeTagNumber
+from .asn1 import ASN1Reader, ASN1Writer, TagClass, TypeTagNumber
 
 
 def unpack_ldap_control(
     reader: ASN1Reader,
+    options: ControlOptions,
 ) -> LDAPControl:
     """Unpack an LDAP control.
 
@@ -27,9 +28,12 @@ def unpack_ldap_control(
 
     control_type = control_reader.read_octet_string(
         hint="Control.controlType",
-    ).decode(reader.string_encoding)
+    ).decode(options.string_encoding)
 
-    unpack_func = CONTROL_UNPACKER.get(control_type, None)
+    unpack_func = next(
+        (c.unpack for c in options.choices if c.control_type == control_type),
+        LDAPControl.unpack,
+    )
     criticality = False
 
     next_header = control_reader.peek_header()
@@ -47,14 +51,38 @@ def unpack_ldap_control(
             hint="Control.controlValue",
         )
 
-    if unpack_func:
-        return unpack_func(criticality, control_value)
-    else:
-        return LDAPControl(
-            control_type=control_type,
-            critical=criticality,
-            value=control_value,
-        )
+    control = unpack_func(
+        control_type=control_type,
+        critical=criticality,
+        value=control_value,
+        options=options,
+    )
+    # Ensures unpacking a control always has this value
+    control.value = control_value
+
+    return control
+
+
+@dataclasses.dataclass
+class ControlOptions:
+    """Options used for Control packing and unpacking.
+
+    Custom options used for packing and unpacking control objects.
+
+    Attributes:
+        string_encoding: The encoding that is used to encode and decode
+            strings. Defaults to utf-8.
+        choices: List of known controls.
+    """
+
+    string_encoding: str = "utf-8"
+    choices: t.List[t.Type[LDAPControl]] = dataclasses.field(
+        default_factory=lambda: [
+            PagedResultControl,
+            ShowDeactivatedLinkControl,
+            ShowDeletedControl,
+        ]
+    )
 
 
 @dataclasses.dataclass
@@ -75,13 +103,41 @@ class LDAPControl:
     bytes but the ``size`` and ``cookie`` attributes will also be present. In
     the future more controls will be added.
 
+    A custom implementation must inherit this class and provide a value for
+    control_type as well as implement the ``get_value`` and ``unpack``
+    methods.
+
+    Example:
+        .. code-block:: python
+
+            @dataclasses.dataclass
+            class CustomControl(LDAPControl):
+                control_type = dataclasses.field(init=False, repr=False, default="1.2.3.4")
+
+                size: int
+
+                def get_value(
+                    self,
+                    options: ControlOptions,
+                ) -> t.Optional[bytes]:
+                    return self.size.to_bytes(4)
+
+                @classmethod
+                def unpack(
+                    cls,
+                    control_type: str,
+                    critical: bool,
+                    value: t.Optional[bytes],
+                    options: ControlOptions,
+                ) -> PagedResultControl:
+                    size = struct.unpack("<I", (value or b""))[0]
+
+                    return CustomControl(critical=critical, size=size)
+
     Args:
         control_type: The control OID string.
         critical: Whether the control is marked as critical or not.
         value: The raw control value, if any.
-
-    Attributes:
-        value:
 
     .. _RFC 4511 4.1.11. Controls:
         https://www.rfc-editor.org/rfc/rfc4511#section-4.1.11
@@ -97,24 +153,36 @@ class LDAPControl:
     critical: bool
     value: t.Optional[bytes] = None
 
-    def _pack_internal(
+    def pack(
         self,
         writer: ASN1Writer,
+        options: ControlOptions,
     ) -> None:
         with writer.push_sequence() as control_writer:
-            control_writer.write_octet_string(self.control_type.encode(writer.string_encoding))
+            control_writer.write_octet_string(self.control_type.encode(options.string_encoding))
 
             if self.critical:
                 control_writer.write_boolean(self.critical)
 
-            self._write_value(control_writer)
+            value = self.get_value(options)
+            if value is not None:
+                control_writer.write_octet_string(value)
 
-    def _write_value(
+    def get_value(
         self,
-        writer: ASN1Writer,
-    ) -> None:
-        if self.value is not None:
-            writer.write_octet_string(self.value)
+        options: ControlOptions,
+    ) -> t.Optional[bytes]:
+        return self.value
+
+    @classmethod
+    def unpack(
+        cls,
+        control_type: str,
+        critical: bool,
+        value: t.Optional[bytes],
+        options: ControlOptions,
+    ) -> LDAPControl:
+        return LDAPControl(control_type, critical, value)
 
 
 @dataclasses.dataclass
@@ -135,6 +203,16 @@ class ShowDeletedControl(_KnownControl):
 
     control_type: str = dataclasses.field(init=False, default="1.2.840.113556.1.4.417")
 
+    @classmethod
+    def unpack(
+        cls,
+        control_type: str,
+        critical: bool,
+        value: t.Optional[bytes],
+        options: ControlOptions,
+    ) -> ShowDeletedControl:
+        return ShowDeletedControl(critical=critical)
+
 
 @dataclasses.dataclass
 class ShowDeactivatedLinkControl(_KnownControl):
@@ -146,6 +224,16 @@ class ShowDeactivatedLinkControl(_KnownControl):
     """
 
     control_type: str = dataclasses.field(init=False, default="1.2.840.113556.1.4.2065")
+
+    @classmethod
+    def unpack(
+        cls,
+        control_type: str,
+        critical: bool,
+        value: t.Optional[bytes],
+        options: ControlOptions,
+    ) -> ShowDeactivatedLinkControl:
+        return ShowDeactivatedLinkControl(critical=critical)
 
 
 @dataclasses.dataclass
@@ -177,56 +265,29 @@ class PagedResultControl(_KnownControl):
     size: int
     cookie: bytes
 
-    def _write_value(
+    def get_value(
         self,
-        writer: ASN1Writer,
-    ) -> None:
-        # Write it like a sequence but with an OCTET_STRING tag
-        with writer.push_sequence(
-            ASN1Tag.universal_tag(TypeTagNumber.OCTET_STRING, False),
-        ) as value_writer:
-            with value_writer.push_sequence() as inner_writer:
-                inner_writer.write_integer(self.size)
-                inner_writer.write_octet_string(self.cookie)
+        options: ControlOptions,
+    ) -> t.Optional[bytes]:
+        writer = ASN1Writer()
+        with writer.push_sequence() as inner_writer:
+            inner_writer.write_integer(self.size)
+            inner_writer.write_octet_string(self.cookie)
 
+        return bytes(writer.get_data())
 
-T = t.TypeVar("T", bound=_KnownControl)
+    @classmethod
+    def unpack(
+        cls,
+        control_type: str,
+        critical: bool,
+        value: t.Optional[bytes],
+        options: ControlOptions,
+    ) -> PagedResultControl:
+        reader = ASN1Reader(value or b"")
+        control_reader = reader.read_sequence(hint="PagedResultControl")
 
+        size = control_reader.read_integer(hint="PagedResultControl.size")
+        cookie = control_reader.read_octet_string(hint="PagedResultControl.cookie")
 
-def _unpack_with_value(
-    control_type: t.Type[T],
-    critical: bool,
-    value: t.Optional[bytes],
-) -> T:
-    obj = control_type(critical=critical)
-    obj.value = value
-
-    return obj
-
-
-def _unpack_paged_result_control(
-    critical: bool,
-    value: t.Optional[bytes],
-) -> PagedResultControl:
-    reader = ASN1Reader(value or b"")
-    control_reader = reader.read_sequence(hint="PagedResultControl")
-
-    size = control_reader.read_integer(hint="PagedResultControl.size")
-    cookie = control_reader.read_octet_string(hint="PagedResultControl.cookie")
-
-    control = PagedResultControl(
-        critical=critical,
-        size=size,
-        cookie=cookie,
-    )
-
-    # Kept for backwards compatibility, all unpacked object should have a value
-    control.value = value
-    return control
-
-
-CONTROL_UNPACKER: t.Dict[str, t.Callable[[bool, t.Optional[bytes]], LDAPControl]] = {
-    ShowDeletedControl.control_type: lambda c, v: _unpack_with_value(ShowDeletedControl, c, v),
-    ShowDeactivatedLinkControl.control_type: lambda c, v: _unpack_with_value(ShowDeactivatedLinkControl, c, v),
-    PagedResultControl.control_type: _unpack_paged_result_control,
-}
+        return PagedResultControl(critical=critical, size=size, cookie=cookie)

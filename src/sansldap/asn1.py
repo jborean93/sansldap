@@ -12,7 +12,7 @@ T = t.TypeVar("T", bound=int)
 
 
 class NotEnougData(Exception):
-    ...
+    "There is not enough data available to unpack ASN.1 value"
 
 
 class TagClass(enum.IntEnum):
@@ -103,10 +103,7 @@ class ASN1Reader:
     def __init__(
         self,
         data: t.Union[bytes, bytearray, memoryview],
-        *,
-        string_encoding: str = "utf-8",
     ) -> None:
-        self.string_encoding = string_encoding
         self._data = data
         self._view = memoryview(self._data)
 
@@ -206,7 +203,7 @@ class ASN1Reader:
         )
         self._view = self._view[consumed:]
 
-        return ASN1Reader(new_view, string_encoding=self.string_encoding)
+        return ASN1Reader(new_view)
 
     read_set_of = read_set
 
@@ -224,7 +221,7 @@ class ASN1Reader:
         )
         self._view = self._view[consumed:]
 
-        return ASN1Reader(new_view, string_encoding=self.string_encoding)
+        return ASN1Reader(new_view)
 
     read_sequence_of = read_sequence
 
@@ -233,11 +230,9 @@ class ASN1Writer:
     def __init__(
         self,
         *,
-        string_encoding: str = "utf-8",
         tag: t.Optional[ASN1Tag] = None,
         parent: t.Optional[ASN1Writer] = None,
     ) -> None:
-        self.string_encoding = string_encoding
         self._data = bytearray()
         self._tag = tag
         self._parent = parent
@@ -268,7 +263,7 @@ class ASN1Writer:
     ) -> ASN1Writer:
         if not tag:
             tag = ASN1Tag.universal_tag(TypeTagNumber.SEQUENCE, is_constructed=True)
-        return ASN1Writer(tag=tag, parent=self, string_encoding=self.string_encoding)
+        return ASN1Writer(tag=tag, parent=self)
 
     push_sequence_of = push_sequence
 
@@ -278,7 +273,7 @@ class ASN1Writer:
     ) -> ASN1Writer:
         if not tag:
             tag = ASN1Tag.universal_tag(TypeTagNumber.SET, is_constructed=True)
-        return ASN1Writer(tag=tag, parent=self, string_encoding=self.string_encoding)
+        return ASN1Writer(tag=tag, parent=self)
 
     push_set_of = push_set
 
@@ -404,7 +399,7 @@ def _pack_asn1_boolean(
     if not tag:
         tag = ASN1Tag.universal_tag(TypeTagNumber.BOOLEAN)
 
-    return _pack_asn1(tag.tag_class, tag.is_constructed, tag.tag_number, b"\x01" if value else b"\x00")
+    return _pack_asn1(tag.tag_class, tag.is_constructed, tag.tag_number, b"\xFF" if value else b"\x00")
 
 
 def _pack_asn1_enumerated(
@@ -511,8 +506,10 @@ def _read_asn1_header(
 
     if length == 0b1000000:
         # Indefinite length, the length is not known and will be marked by two
-        # NULL octets known as end-of-content octets later in the stream.
-        length = -1
+        # NULL octets known as end-of-content octets later in the stream. It is
+        # not meant to be sent in LDAP so fail here.
+        # https://www.rfc-editor.org/rfc/rfc4511#section-5.1
+        raise ValueError("Received BER indefinite encoded value which is unsupported by LDAP messages")
 
     elif length & 0b10000000:
         # If the MSB is set then the length octet just contains the number of
@@ -662,9 +659,6 @@ def _validate_tag(
         raise ValueError(f"Expected tag {expected_tag}{hint_str} but got {actual_tag}")
 
     view = view[tag_length:]
-    if data_length == -1:
-        raise NotImplementedError("Indefinite length not implemented yet")
-
     if len(view) < data_length:
         raise NotEnougData(f"Not enough data{hint_str}: expecting {data_length} but got {len(view)}")
 
@@ -714,3 +708,14 @@ def _pack_asn1_octet_number(
     num_octets.reverse()
 
     return num_octets
+
+
+__all__ = [
+    "ASN1Reader",
+    "ASN1Writer",
+    "ASN1Header",
+    "ASN1Tag",
+    "NotEnougData",
+    "TagClass",
+    "TypeTagNumber",
+]

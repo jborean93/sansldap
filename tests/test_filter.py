@@ -7,12 +7,12 @@ import typing as t
 import pytest
 
 import sansldap._filter as f
-from sansldap._asn1 import ASN1Reader
+from sansldap.asn1 import ASN1Reader
 
 
 def unpack_filter(data: bytes) -> f.LDAPFilter:
     reader = ASN1Reader(data)
-    return f.unpack_ldap_filter(reader)
+    return f.LDAPFilter.unpack(reader, f.FilterOptions())
 
 
 def test_filter_and_unpack() -> None:

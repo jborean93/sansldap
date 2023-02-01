@@ -1,6 +1,9 @@
 # Copyright: (c) 2023, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+import sansldap.asn1 as asn1
+
+from ._authentication import AuthenticationCredential, SaslCredential, SimpleCredential
 from ._controls import (
     LDAPControl,
     PagedResultControl,
@@ -30,31 +33,32 @@ from ._messages import (
     LDAPResult,
     LDAPResultCode,
     PartialAttribute,
-    SaslCredential,
     SearchRequest,
     SearchResultDone,
     SearchResultEntry,
     SearchResultReference,
     SearchScope,
-    SimpleCredential,
     UnbindRequest,
 )
 from ._session import (
+    ExtendedOperations,
     LDAPClient,
     LDAPError,
     LDAPServer,
     LDAPSession,
     ProtocolError,
     SessionState,
-    StateError,
 )
 
 __all__ = [
+    "asn1",
+    "AuthenticationCredential",
     "BindRequest",
     "BindResponse",
     "DereferencingPolicy",
     "ExtendedRequest",
     "ExtendedResponse",
+    "ExtendedOperations",
     "FilterAnd",
     "FilterApproxMatch",
     "FilterEquality",
@@ -87,6 +91,6 @@ __all__ = [
     "ShowDeactivatedLinkControl",
     "ShowDeletedControl",
     "SimpleCredential",
-    "StateError",
+    "LDAPError",
     "UnbindRequest",
 ]

@@ -92,6 +92,23 @@ class LDAPClient:
         msg_id = self.protocol.bind_simple(username, password)
         await self._send_and_wait(msg_id)
 
+    async def search_request(
+        self,
+        base_object: str,
+    ) -> None:
+        msg_id = self.protocol.search_request(
+            base_object=base_object,
+            scope=sansldap.SearchScope.SUBTREE,
+            dereferencing_policy=sansldap.DereferencingPolicy.NEVER,
+            size_limit=0,
+            time_limit=0,
+            types_only=False,
+            filter=sansldap.FilterPresent("objectClass"),
+            attributes=["schemaNamingContext"],
+            controls=None,
+        )
+        await self._send_and_wait(msg_id)
+
     async def _read_loop(self) -> None:
         while True:
             try:

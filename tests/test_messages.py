@@ -1,17 +1,21 @@
 # Copyright: (c) 2023, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+import sansldap._authentication as a
 import sansldap._controls as c
 import sansldap._filter as f
 import sansldap._messages as m
-from sansldap._asn1 import ASN1Reader
+from sansldap.asn1 import ASN1Reader
 
 from .conftest import get_test_data
 
+PACKING_OPTIONS = m.PackingOptions()
+
 
 def unpack_message(data: bytes) -> m.LDAPMessage:
+
     reader = ASN1Reader(data)
-    return m.unpack_ldap_message(reader)
+    return m.unpack_ldap_message(reader, PACKING_OPTIONS)
 
 
 class TestBindRequest:
@@ -21,9 +25,9 @@ class TestBindRequest:
             controls=[],
             version=3,
             name="CN=User",
-            authentication=m.SimpleCredential("password"),
+            authentication=a.SimpleCredential("password"),
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -32,7 +36,7 @@ class TestBindRequest:
         assert unpacked.controls == []
         assert unpacked.version == 3
         assert unpacked.name == "CN=User"
-        assert isinstance(unpacked.authentication, m.SimpleCredential)
+        assert isinstance(unpacked.authentication, a.SimpleCredential)
         assert unpacked.authentication.password == "password"
 
     def test_simple_parse(self) -> None:
@@ -44,7 +48,7 @@ class TestBindRequest:
         assert actual.controls == []
         assert actual.version == 3
         assert actual.name == "vagrant"
-        assert isinstance(actual.authentication, m.SimpleCredential)
+        assert isinstance(actual.authentication, a.SimpleCredential)
         assert actual.authentication.password == "vagrant"
 
     def test_sasl_create(self) -> None:
@@ -53,12 +57,12 @@ class TestBindRequest:
             controls=[],
             version=3,
             name="UserName",
-            authentication=m.SaslCredential(
+            authentication=a.SaslCredential(
                 mechanism="GSSAPI",
                 credentials=b"abcdef\x00",
             ),
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -67,7 +71,7 @@ class TestBindRequest:
         assert unpacked.controls == []
         assert unpacked.version == 3
         assert unpacked.name == "UserName"
-        assert isinstance(unpacked.authentication, m.SaslCredential)
+        assert isinstance(unpacked.authentication, a.SaslCredential)
         assert unpacked.authentication.mechanism == "GSSAPI"
         assert unpacked.authentication.credentials == b"abcdef\x00"
 
@@ -80,7 +84,7 @@ class TestBindRequest:
         assert actual.controls == []
         assert actual.version == 3
         assert actual.name == ""
-        assert isinstance(actual.authentication, m.SaslCredential)
+        assert isinstance(actual.authentication, a.SaslCredential)
         assert actual.authentication.mechanism == "GSS-SPNEGO"
         assert isinstance(actual.authentication.credentials, bytes)
         assert len(actual.authentication.credentials) == 1526
@@ -99,7 +103,7 @@ class TestBindResponse:
             ),
             server_sasl_creds=b"abc\x00",
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -124,7 +128,7 @@ class TestBindResponse:
             ),
             server_sasl_creds=None,
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -160,7 +164,7 @@ class TestSearchRequest:
             filter=f.FilterPresent("myAttribute"),
             attributes=["attr1", "attr 2"],
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -217,7 +221,7 @@ class TestSearchResultEntry:
                 m.PartialAttribute("name 3", [b"foo bar"]),
             ],
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -278,7 +282,7 @@ class TestSearchResultDone:
                 referrals=None,
             ),
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -301,7 +305,7 @@ class TestSearchResultDone:
                 referrals=None,
             ),
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -332,7 +336,7 @@ class TestSearchResultDone:
                 ],
             ),
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -394,7 +398,7 @@ class TestExtendedRequest:
             name="1.2.3.1293.492190.1",
             value=b"abc\x00",
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -411,7 +415,7 @@ class TestExtendedRequest:
             name="1.2.3.1293.492190.1",
             value=None,
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -445,7 +449,7 @@ class TestExtendedResponse:
             name="1.2.3.1293.492190.1",
             value=b"abc\x00",
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)
@@ -472,7 +476,7 @@ class TestExtendedResponse:
             name=None,
             value=None,
         )
-        actual = msg.pack()
+        actual = msg.pack(PACKING_OPTIONS)
         assert isinstance(actual, bytes)
 
         unpacked = unpack_message(actual)

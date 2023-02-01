@@ -7,13 +7,34 @@ import dataclasses
 import enum
 import typing as t
 
-from ._asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass
-from ._controls import LDAPControl, unpack_ldap_control
-from ._filter import LDAPFilter, unpack_ldap_filter
+from ._authentication import AuthenticationCredential, AuthenticationOptions
+from ._controls import ControlOptions, LDAPControl, unpack_ldap_control
+from ._filter import FilterOptions, LDAPFilter
+from .asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass
+
+
+@dataclasses.dataclass
+class PackingOptions:
+    """Packing Options.
+
+    Various options to control the packing and unpacking phase of LDAP messages.
+
+    Args:
+        string_encoding: The encoding used for encoding and decoding bytes.
+        authentication: Options used to pack/unpack Authentication credentials.
+        control: Options used to pack/unpack Control values.
+        filter: Options used to pack/unpack LDAP filters.
+    """
+
+    string_encoding: str = "utf-8"
+    authentication: AuthenticationOptions = dataclasses.field(default_factory=AuthenticationOptions)
+    control: ControlOptions = dataclasses.field(default_factory=ControlOptions)
+    filter: FilterOptions = dataclasses.field(default_factory=FilterOptions)
 
 
 def unpack_ldap_message(
     reader: ASN1Reader,
+    options: PackingOptions,
 ) -> LDAPMessage:
     """Unpack an LDAP message.
 
@@ -22,6 +43,7 @@ def unpack_ldap_message(
 
     Args:
         reader: The ASN.1 reader to read from.
+        packing: Custom options to control the unpack methods.
 
     Returns:
         LDAPMessage: The unpacked message object.
@@ -55,7 +77,7 @@ def unpack_ldap_message(
                     hint="LDAPMessage.controls",
                 )
                 while control_reader:
-                    control = unpack_ldap_control(control_reader)
+                    control = unpack_ldap_control(control_reader, options.control)
                     controls.append(control)
 
                 continue
@@ -69,12 +91,12 @@ def unpack_ldap_message(
                 response_name = message.read_octet_string(
                     header=next_header,
                     hint="LDAPMessage.responseName",
-                ).decode(reader.string_encoding)
+                ).decode(options.string_encoding)
                 continue
 
         message.skip_value(next_header)
 
-    msg = unpack_func(protocol_reader, message_id, controls)
+    msg = unpack_func(protocol_reader, options, message_id, controls)
 
     # Need to inject the MS-ADTS extension to this message.
     if isinstance(msg, ExtendedResponse) and response_name and not msg.name:
@@ -180,6 +202,14 @@ class SearchScope(enum.IntEnum):
     "The scope is constrained to base_object and all its subordinates."
 
 
+class Request:
+    "Identifies LDAP requests"
+
+
+class Response:
+    "Identifies LDAP responses"
+
+
 @dataclasses.dataclass
 class LDAPMessage:
     """The base LDAP Message object.
@@ -231,7 +261,10 @@ class LDAPMessage:
     message_id: int
     controls: t.List[LDAPControl]
 
-    def pack(self) -> bytes:
+    def pack(
+        self,
+        options: PackingOptions,
+    ) -> bytes:
         """Packs the current message.
 
         Packs the current message and returns the bytes string that can be
@@ -248,26 +281,27 @@ class LDAPMessage:
             with seq.push_sequence(
                 ASN1Tag(TagClass.APPLICATION, self.tag_number, True),
             ) as inner:
-                self._pack_inner(inner)
+                self._pack_inner(inner, options)
 
             if self.controls:
                 with seq.push_sequence(
                     ASN1Tag(TagClass.CONTEXT_SPECIFIC, 0, True),
                 ) as control_writer:
                     for control in self.controls:
-                        control._pack_internal(control_writer)
+                        control.pack(control_writer, options.control)
 
         return bytes(writer.get_data())
 
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        packing: PackingOptions,
     ) -> None:
         return
 
 
 @dataclasses.dataclass
-class BindRequest(LDAPMessage):
+class BindRequest(LDAPMessage, Request):
     """The bind request message.
 
     This object is used to exchange authentication and security-related
@@ -304,56 +338,27 @@ class BindRequest(LDAPMessage):
 
     version: int
     name: str
-    authentication: t.Union[SimpleCredential, SaslCredential]
+    authentication: AuthenticationCredential
 
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
         writer.write_integer(self.version)
-        writer.write_octet_string(self.name.encode(writer.string_encoding))
-        self.authentication._pack_inner(writer)
+        writer.write_octet_string(self.name.encode(options.string_encoding))
+        self.authentication.pack(writer, options.authentication)
 
 
 def _unpack_bind_request(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> BindRequest:
     version = reader.read_integer(hint="BindRequest.version")
-    name = reader.read_octet_string(hint="BindRequest.name").decode(reader.string_encoding)
-
-    next_header = reader.peek_header()
-    authentication: t.Optional[t.Union[SimpleCredential, SaslCredential]] = None
-    if next_header.tag.tag_class == TagClass.CONTEXT_SPECIFIC:
-        if next_header.tag.tag_number == SimpleCredential.authentication_id:
-            password = reader.read_octet_string(
-                header=next_header,
-                hint="BindRequest.authentication.simple",
-            )
-            authentication = SimpleCredential(password=password.decode(reader.string_encoding))
-
-        elif next_header.tag.tag_number == SaslCredential.authentication_id:
-            sasl_reader = reader.read_sequence(
-                header=next_header,
-                hint="BindRequest.authentication.sasl",
-            )
-
-            mechanism = sasl_reader.read_octet_string(
-                hint="BindRequest.authentication.sasl.mechanism",
-            ).decode(reader.string_encoding)
-
-            credentials = sasl_reader.read_octet_string(
-                hint="BindRequest.authentication.sasl.credentials",
-            )
-
-            authentication = SaslCredential(
-                mechanism=mechanism,
-                credentials=credentials,
-            )
-
-    if authentication is None:
-        raise ValueError(f"Expecting BindRequest authentication choice of 0 or 3 but got {next_header}")
+    name = reader.read_octet_string(hint="BindRequest.name").decode(options.string_encoding)
+    authentication = AuthenticationCredential.unpack(reader, options.authentication)
 
     return BindRequest(
         message_id=message_id,
@@ -365,7 +370,7 @@ def _unpack_bind_request(
 
 
 @dataclasses.dataclass
-class BindResponse(LDAPMessage):
+class BindResponse(LDAPMessage, Response):
     """The bind response message.
 
     This is the response to a :class:`BindRequest`. It contains the status
@@ -394,8 +399,9 @@ class BindResponse(LDAPMessage):
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
-        self.result._pack_inner(writer)
+        self.result._pack_inner(writer, options)
 
         if self.server_sasl_creds is not None:
             writer.write_octet_string(
@@ -406,10 +412,11 @@ class BindResponse(LDAPMessage):
 
 def _unpack_bind_response(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> BindResponse:
-    result = _unpack_ldap_result(reader)
+    result = _unpack_ldap_result(reader, options)
 
     sasl_creds: t.Optional[bytes] = None
     while reader:
@@ -433,7 +440,7 @@ def _unpack_bind_response(
 
 
 @dataclasses.dataclass
-class UnbindRequest(LDAPMessage):
+class UnbindRequest(LDAPMessage, Request):
     """The unbind request message.
 
     A message used to signal the LDAP session is to be terminated. There is no
@@ -455,7 +462,7 @@ class UnbindRequest(LDAPMessage):
 
 
 @dataclasses.dataclass
-class SearchRequest(LDAPMessage):
+class SearchRequest(LDAPMessage, Request):
     """The search request message.
 
     This object is used to start a search operation with the parameters
@@ -532,22 +539,24 @@ class SearchRequest(LDAPMessage):
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
-        writer.write_octet_string(self.base_object.encode(writer.string_encoding))
+        writer.write_octet_string(self.base_object.encode(options.string_encoding))
         writer.write_enumerated(self.scope.value)
         writer.write_enumerated(self.deref_aliases.value)
         writer.write_integer(self.size_limit)
         writer.write_integer(self.time_limit)
         writer.write_boolean(self.types_only)
-        self.filter._pack_internal(writer)
+        self.filter.pack(writer, options.filter)
 
         with writer.push_sequence_of() as attr_writer:
             for attr in self.attributes:
-                attr_writer.write_octet_string(attr.encode(writer.string_encoding))
+                attr_writer.write_octet_string(attr.encode(options.string_encoding))
 
 
 def _unpack_search_request(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> SearchRequest:
@@ -560,7 +569,7 @@ def _unpack_search_request(
     size_limit = reader.read_integer(hint="SearchRequest.sizeLimt")
     time_limit = reader.read_integer(hint="SearchRequest.timeLimit")
     types_only = reader.read_boolean(hint="SearchRequest.typesOnly")
-    filter = unpack_ldap_filter(reader)
+    filter = LDAPFilter.unpack(reader, options.filter)
 
     attributes: t.List[str] = []
     attributes_reader = reader.read_sequence(hint="SearchRequest.attributes")
@@ -568,12 +577,12 @@ def _unpack_search_request(
         attr = attributes_reader.read_octet_string(
             hint="SearchRequest.attributes.value",
         )
-        attributes.append(attr.decode(reader.string_encoding))
+        attributes.append(attr.decode(options.string_encoding))
 
     return SearchRequest(
         message_id=message_id,
         controls=controls,
-        base_object=base_object.decode(reader.string_encoding),
+        base_object=base_object.decode(options.string_encoding),
         scope=scope,
         deref_aliases=deref_aliases,
         size_limit=size_limit,
@@ -585,7 +594,7 @@ def _unpack_search_request(
 
 
 @dataclasses.dataclass
-class SearchResultEntry(LDAPMessage):
+class SearchResultEntry(LDAPMessage, Response):
     """The search result entry message.
 
     This object is used as a response to a search request. The
@@ -616,16 +625,18 @@ class SearchResultEntry(LDAPMessage):
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
-        writer.write_octet_string(self.object_name.encode(writer.string_encoding))
+        writer.write_octet_string(self.object_name.encode(options.string_encoding))
 
         with writer.push_sequence_of() as attr_writer:
             for attribute in self.attributes:
-                attribute._pack_inner(attr_writer)
+                attribute._pack_inner(attr_writer, options)
 
 
 def _unpack_search_result_entry(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> SearchResultEntry:
@@ -638,13 +649,13 @@ def _unpack_search_result_entry(
 
     object_name = reader.read_octet_string(
         hint="SearchResultEntry.objectName",
-    ).decode(reader.string_encoding)
+    ).decode(options.string_encoding)
 
     attributes: t.List[PartialAttribute] = []
     attr_reader = reader.read_sequence(hint="SearchResultEntry.attributes")
 
     while attr_reader:
-        attr = _unpack_partial_attribute(attr_reader)
+        attr = _unpack_partial_attribute(attr_reader, options)
         attributes.append(attr)
 
     return SearchResultEntry(
@@ -656,7 +667,7 @@ def _unpack_search_result_entry(
 
 
 @dataclasses.dataclass
-class SearchResultDone(LDAPMessage):
+class SearchResultDone(LDAPMessage, Response):
     """The search result done message.
 
     This object is used as a response to a search request and marks the end of
@@ -681,16 +692,18 @@ class SearchResultDone(LDAPMessage):
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
-        self.result._pack_inner(writer)
+        self.result._pack_inner(writer, options)
 
 
 def _unpack_search_result_done(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> SearchResultDone:
-    result = _unpack_ldap_result(reader)
+    result = _unpack_ldap_result(reader, options)
     return SearchResultDone(
         message_id=message_id,
         controls=controls,
@@ -699,7 +712,7 @@ def _unpack_search_result_done(
 
 
 @dataclasses.dataclass
-class SearchResultReference(LDAPMessage):
+class SearchResultReference(LDAPMessage, Response):
     """The search result reference message.
 
     Sent by the server in a search request operation when it is unable, or
@@ -729,13 +742,15 @@ class SearchResultReference(LDAPMessage):
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
         for uri in self.uris:
-            writer.write_octet_string(uri.encode(writer.string_encoding))
+            writer.write_octet_string(uri.encode(options.string_encoding))
 
 
 def _unpack_search_result_reference(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> SearchResultReference:
@@ -743,7 +758,7 @@ def _unpack_search_result_reference(
     while reader:
         uri = reader.read_octet_string(
             hint="SearchResultReference.uri",
-        ).decode(reader.string_encoding)
+        ).decode(options.string_encoding)
         uris.append(uri)
 
     return SearchResultReference(
@@ -754,7 +769,7 @@ def _unpack_search_result_reference(
 
 
 @dataclasses.dataclass
-class ExtendedRequest(LDAPMessage):
+class ExtendedRequest(LDAPMessage, Request):
     """The extended request message.
 
     An extended operation is a custom operation not strictly defined in the
@@ -784,9 +799,13 @@ class ExtendedRequest(LDAPMessage):
     name: str
     value: t.Optional[bytes]
 
-    def _pack_inner(self, writer: ASN1Writer) -> None:
+    def _pack_inner(
+        self,
+        writer: ASN1Writer,
+        options: PackingOptions,
+    ) -> None:
         writer.write_octet_string(
-            self.name.encode(writer.string_encoding),
+            self.name.encode(options.string_encoding),
             tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, 0, False),
         )
 
@@ -799,6 +818,7 @@ class ExtendedRequest(LDAPMessage):
 
 def _unpack_extended_request(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> ExtendedRequest:
@@ -813,7 +833,7 @@ def _unpack_extended_request(
             is_constructed=False,
         ),
         hint="ExtendedRequest.requestName",
-    ).decode(reader.string_encoding)
+    ).decode(options.string_encoding)
 
     value: t.Optional[bytes] = None
     while reader:
@@ -837,7 +857,7 @@ def _unpack_extended_request(
 
 
 @dataclasses.dataclass
-class ExtendedResponse(LDAPMessage):
+class ExtendedResponse(LDAPMessage, Response):
     """The extended response message.
 
     The response to an extended request and contains the result of the
@@ -869,12 +889,16 @@ class ExtendedResponse(LDAPMessage):
     name: t.Optional[str]
     value: t.Optional[bytes]
 
-    def _pack_inner(self, writer: ASN1Writer) -> None:
-        self.result._pack_inner(writer)
+    def _pack_inner(
+        self,
+        writer: ASN1Writer,
+        options: PackingOptions,
+    ) -> None:
+        self.result._pack_inner(writer, options)
 
         if self.name is not None:
             writer.write_octet_string(
-                self.name.encode(writer.string_encoding),
+                self.name.encode(options.string_encoding),
                 ASN1Tag(TagClass.CONTEXT_SPECIFIC, 10, False),
             )
 
@@ -887,6 +911,7 @@ class ExtendedResponse(LDAPMessage):
 
 def _unpack_extended_response(
     reader: ASN1Reader,
+    options: PackingOptions,
     message_id: int,
     controls: t.List[LDAPControl],
 ) -> ExtendedResponse:
@@ -894,7 +919,7 @@ def _unpack_extended_response(
     #      COMPONENTS OF LDAPResult,
     #      responseName     [10] LDAPOID OPTIONAL,
     #      responseValue    [11] OCTET STRING OPTIONAL }
-    result = _unpack_ldap_result(reader)
+    result = _unpack_ldap_result(reader, options)
 
     name: t.Optional[str] = None
     value: t.Optional[bytes] = None
@@ -907,7 +932,7 @@ def _unpack_extended_response(
                 name = reader.read_octet_string(
                     header=next_header,
                     hint="ExtendedResponse.responseName",
-                ).decode(reader.string_encoding)
+                ).decode(options.string_encoding)
                 continue
 
             elif next_header.tag.tag_number == 11:
@@ -926,70 +951,6 @@ def _unpack_extended_response(
         name=name,
         value=value,
     )
-
-
-@dataclasses.dataclass
-class SimpleCredential:
-    """The Simple Credential.
-
-    This object is used to encode the simple password for a
-    :class:`BindRequest`.
-
-    Args:
-        password: The password to authenticate with or an empty string for an
-            identity only, or anonymous, bind operation.
-    """
-
-    authentication_id: int = dataclasses.field(init=False, repr=False, default=0)
-
-    password: str
-
-    def _pack_inner(
-        self,
-        writer: ASN1Writer,
-    ) -> None:
-        writer.write_octet_string(
-            self.password.encode(writer.string_encoding),
-            ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.authentication_id, False),
-        )
-
-
-@dataclasses.dataclass
-class SaslCredential:
-    """The SASL Credential.
-
-    This object is used to store the SASL credential for a
-    :class:`BindRequest`. It contains the SASL mechanism used and the
-    credential byte string for that credential. The SaslCredentials structure
-    is defined in `RFC 4511 4.2 Bind Operation`_.
-
-    Args:
-        mechanism: The SASL mechanism.
-        credentials: The SASL credential bytes to exchange, if any.
-
-    .. _RFC 4511 4.2. Bind Operation:
-        https://www.rfc-editor.org/rfc/rfc4511#section-4.2
-    """
-
-    # SaslCredentials ::= SEQUENCE {
-    #      mechanism               LDAPString,
-    #      credentials             OCTET STRING OPTIONAL }
-
-    authentication_id: int = dataclasses.field(init=False, repr=False, default=3)
-
-    mechanism: str
-    credentials: t.Optional[bytes]
-
-    def _pack_inner(
-        self,
-        writer: ASN1Writer,
-    ) -> None:
-        with writer.push_sequence(
-            ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.authentication_id, True),
-        ) as sasl_writer:
-            sasl_writer.write_octet_string(self.mechanism.encode(writer.string_encoding))
-            if self.credentials is not None:
-                sasl_writer.write_octet_string(self.credentials)
 
 
 @dataclasses.dataclass
@@ -1081,19 +1042,21 @@ class LDAPResult:
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
         writer.write_enumerated(self.result_code.value)
-        writer.write_octet_string(self.matched_dn.encode(writer.string_encoding))
-        writer.write_octet_string(self.diagnostics_message.encode(writer.string_encoding))
+        writer.write_octet_string(self.matched_dn.encode(options.string_encoding))
+        writer.write_octet_string(self.diagnostics_message.encode(options.string_encoding))
 
         if self.referrals is not None:
             with writer.push_sequence(ASN1Tag(TagClass.CONTEXT_SPECIFIC, 3, True)) as referrals:
                 for r in self.referrals:
-                    referrals.write_octet_string(r.encode(writer.string_encoding))
+                    referrals.write_octet_string(r.encode(options.string_encoding))
 
 
 def _unpack_ldap_result(
     reader: ASN1Reader,
+    options: PackingOptions,
 ) -> LDAPResult:
     result_code = reader.read_enumerated(
         LDAPResultCode,
@@ -1101,11 +1064,11 @@ def _unpack_ldap_result(
     )
     matched_dn = reader.read_octet_string(
         hint="LDAPResult.matchedDN",
-    ).decode(reader.string_encoding)
+    ).decode(options.string_encoding)
 
     diagnostics_message = reader.read_octet_string(
         hint="LDAPResult.diagnosticMessage",
-    ).decode(reader.string_encoding)
+    ).decode(options.string_encoding)
 
     referrals: t.Optional[t.List[str]] = None
     if reader:
@@ -1121,7 +1084,7 @@ def _unpack_ldap_result(
             while referral_reader:
                 r = referral_reader.read_octet_string(
                     hint="LDAPResult.referral",
-                ).decode(reader.string_encoding)
+                ).decode(options.string_encoding)
                 referrals.append(r)
 
     return LDAPResult(
@@ -1160,9 +1123,10 @@ class PartialAttribute:
     def _pack_inner(
         self,
         writer: ASN1Writer,
+        options: PackingOptions,
     ) -> None:
         with writer.push_sequence() as val:
-            val.write_octet_string(self.name.encode(writer.string_encoding))
+            val.write_octet_string(self.name.encode(options.string_encoding))
 
             with val.push_set_of() as values:
                 for v in self.values:
@@ -1171,12 +1135,13 @@ class PartialAttribute:
 
 def _unpack_partial_attribute(
     reader: ASN1Reader,
+    options: PackingOptions,
 ) -> PartialAttribute:
     attr_reader = reader.read_sequence(hint="PartialAttribute")
 
     name = attr_reader.read_octet_string(
         hint="PartialAttribute.type",
-    ).decode(reader.string_encoding)
+    ).decode(options.string_encoding)
 
     values: t.List[bytes] = []
     value_reader = attr_reader.read_set(hint="PartialAttribute.vals")
@@ -1187,10 +1152,10 @@ def _unpack_partial_attribute(
     return PartialAttribute(name=name, values=values)
 
 
-PROTOCOL_PACKER: t.Dict[int, t.Callable[[ASN1Reader, int, t.List[LDAPControl]], LDAPMessage]] = {
+PROTOCOL_PACKER: t.Dict[int, t.Callable[[ASN1Reader, PackingOptions, int, t.List[LDAPControl]], LDAPMessage]] = {
     BindRequest.tag_number: _unpack_bind_request,
     BindResponse.tag_number: _unpack_bind_response,
-    UnbindRequest.tag_number: lambda r, m, c: UnbindRequest(message_id=m, controls=c),
+    UnbindRequest.tag_number: lambda r, o, m, c: UnbindRequest(message_id=m, controls=c),
     SearchRequest.tag_number: _unpack_search_request,
     SearchResultEntry.tag_number: _unpack_search_result_entry,
     SearchResultDone.tag_number: _unpack_search_result_done,

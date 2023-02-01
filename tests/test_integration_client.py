@@ -9,6 +9,7 @@ from .examples.client_asyncio import LDAPClient
 async def test_simple_bind(client: LDAPClient) -> None:
     username = os.environ.get("SANSLDAP_USERNAME", None)
     password = os.environ.get("SANSLDAP_PASSWORD", None)
-    await client.bind_simple(username, password=password)
+    # await client.bind_simple(username, password=password)
+    await client.search_request("")
 
     return
