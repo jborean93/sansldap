@@ -32,7 +32,7 @@ from ._messages import (
 from .asn1 import ASN1Reader, NotEnougData
 
 
-class ExtendedOperations(enum.StrEnum):
+class ExtendedOperations(str, enum.Enum):
     """Known LDAP Extended Operation Names."""
 
     LDAP_NOTICE_OF_DISCONNECTION = "1.3.6.1.4.1.1466.20036"
