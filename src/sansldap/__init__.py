@@ -3,8 +3,14 @@
 
 import sansldap.asn1 as asn1
 
-from ._authentication import AuthenticationCredential, SaslCredential, SimpleCredential
+from ._authentication import (
+    AuthenticationCredential,
+    AuthenticationOptions,
+    SaslCredential,
+    SimpleCredential,
+)
 from ._controls import (
+    ControlOptions,
     LDAPControl,
     PagedResultControl,
     ShowDeactivatedLinkControl,
@@ -18,6 +24,7 @@ from ._filter import (
     FilterGreaterOrEqual,
     FilterLessOrEqual,
     FilterNot,
+    FilterOptions,
     FilterOr,
     FilterPresent,
     FilterSubstrings,
@@ -53,8 +60,10 @@ from ._session import (
 __all__ = [
     "asn1",
     "AuthenticationCredential",
+    "AuthenticationOptions",
     "BindRequest",
     "BindResponse",
+    "ControlOptions",
     "DereferencingPolicy",
     "ExtendedRequest",
     "ExtendedResponse",
@@ -66,6 +75,7 @@ __all__ = [
     "FilterGreaterOrEqual",
     "FilterLessOrEqual",
     "FilterNot",
+    "FilterOptions",
     "FilterOr",
     "FilterPresent",
     "FilterSubstrings",

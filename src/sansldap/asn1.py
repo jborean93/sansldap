@@ -16,6 +16,8 @@ class NotEnougData(Exception):
 
 
 class TagClass(enum.IntEnum):
+    """The ASN.1 tag class types."""
+
     UNIVERSAL = 0
     APPLICATION = 1
     CONTEXT_SPECIFIC = 2
@@ -23,6 +25,8 @@ class TagClass(enum.IntEnum):
 
 
 class TypeTagNumber(enum.IntEnum):
+    """The ASN.1 tag numbers for universal classes."""
+
     END_OF_CONTENT = 0
     BOOLEAN = 1
     INTEGER = 2
@@ -65,6 +69,18 @@ class TypeTagNumber(enum.IntEnum):
 
 
 class ASN1Tag(t.NamedTuple):
+    """ASN.1 tag information.
+
+    Defines the explicit ASN.1 tag used in a value which includes the tag class,
+    tag number, and whether it is a constructed or primitive value.
+
+    Args:
+        tag_class: The tag class the value represents.
+        tag_number: The tag number of the value.
+        is_constructed: Whether the value is constructed (True) or primitive
+            (False).
+    """
+
     tag_class: TagClass
     tag_number: t.Union[int, TypeTagNumber]
     is_constructed: bool
@@ -75,6 +91,7 @@ class ASN1Tag(t.NamedTuple):
         number: TypeTagNumber,
         is_constructed: bool = False,
     ) -> ASN1Tag:
+        """Generates a universal tag with the type specified."""
         return ASN1Tag(
             tag_class=TagClass.UNIVERSAL,
             tag_number=number,
@@ -100,6 +117,15 @@ class ASN1Header(t.NamedTuple):
 
 
 class ASN1Reader:
+    """ASN.1 value reader.
+
+    Class used to read ASN.1 data that is passed in. It provides a an easy way
+    to stream through the data as well as peek as the subsequent entries.
+
+    Args:
+        data: The data to read from.
+    """
+
     def __init__(
         self,
         data: t.Union[bytes, bytearray, memoryview],
@@ -111,15 +137,33 @@ class ASN1Reader:
         return bool(self._view)
 
     def peek_header(self) -> ASN1Header:
+        """Get the next value header.
+
+        Gets the header for the next value. This will not read the value so it
+        will still be at the same position once run.
+
+        Returns:
+            ASN1Header: The header information including the tag information as
+            well as the length of the next value.
+        """
         return _read_asn1_header(self._view)
 
     def skip_value(
         self,
         header: ASN1Header,
     ) -> None:
+        """Skips the next value.
+
+        Skips the next value as indicated by the header.
+
+        Args:
+            header: The header which contains the metadata of the next value to
+                skip.
+        """
         self._value = self._view[header.tag_length + header.length :]
 
     def get_remaining_data(self) -> bytes:
+        """Gets the remaining data in the reader."""
         data = self._view.tobytes()
         self._view = memoryview(b"")
         return data
@@ -130,6 +174,19 @@ class ASN1Reader:
         header: t.Optional[ASN1Header] = None,
         hint: t.Optional[str] = None,
     ) -> bool:
+        """Reads an ASN.1 BOOLEAN value.
+
+        Args:
+            tag: The tag to validate with, defaults to the BOOLEAN universal
+                tag.
+            header: Optional header from :func:`peek_header` to make the
+                extraction more efficient.
+            hint: A hint used in error messages to display what this step was
+                used for.
+
+        Returns:
+            bool: The bool value.
+        """
         val, consumed = _read_asn1_boolean(
             self._view,
             tag=tag,
@@ -147,6 +204,20 @@ class ASN1Reader:
         header: t.Optional[ASN1Header] = None,
         hint: t.Optional[str] = None,
     ) -> T:
+        """Reads an ASN.1 ENUMERATED value.
+
+        Args:
+            enum_type: The enum.IntEnum type to cast the integer value to.
+            tag: The tag to validate with, defaults to the ENUMERATED universal
+                tag.
+            header: Optional header from :func:`peek_header` to make the
+                extraction more efficient.
+            hint: A hint used in error messages to display what this step was
+                used for.
+
+        Returns:
+            T: The instance of enum_type that the value represents.
+        """
         val, consumed = _read_asn1_enumerated(
             self._view,
             tag=tag,
@@ -163,6 +234,19 @@ class ASN1Reader:
         header: t.Optional[ASN1Header] = None,
         hint: t.Optional[str] = None,
     ) -> int:
+        """Reads an ASN.1 INTEGER value.
+
+        Args:
+            tag: The tag to validate with, defaults to the INTEGER universal
+                tag.
+            header: Optional header from :func:`peek_header` to make the
+                extraction more efficient.
+            hint: A hint used in error messages to display what this step was
+                used for.
+
+        Returns:
+            int: The int value.
+        """
         val, consumed = _read_asn1_integer(
             self._view,
             tag=tag,
@@ -179,6 +263,22 @@ class ASN1Reader:
         header: t.Optional[ASN1Header] = None,
         hint: t.Optional[str] = None,
     ) -> bytes:
+        """Reads an ASN.1 OCTET_STRING value.
+
+        As this returns a bytes string, it is useful to extract the raw ASN.1
+        value as long as the correct tag or header is provided.
+
+        Args:
+            tag: The tag to validate with, defaults to the OCTET_STRING
+                universal tag (primitive).
+            header: Optional header from :func:`peek_header` to make the
+                extraction more efficient.
+            hint: A hint used in error messages to display what this step was
+                used for.
+
+        Returns:
+            bytes: The octet string bytes.
+        """
         val, consumed = _read_asn1_octet_string(
             self._view,
             tag=tag,
@@ -195,6 +295,22 @@ class ASN1Reader:
         header: t.Optional[ASN1Header] = None,
         hint: t.Optional[str] = None,
     ) -> ASN1Reader:
+        """Reads an ASN.1 SET or SET_OF value.
+
+        The returned reader can be used to then read the values inside the set.
+
+        Args:
+            tag: The tag to validate with, defaults to the SET/SET_OF universal
+                tag.
+            header: Optional header from :func:`peek_header` to make the
+                extraction more efficient.
+            hint: A hint used in error messages to display what this step was
+                used for.
+
+        Returns:
+            ASN1Reader: The ASN.1 reader object that can be used to read the
+                set elements.
+        """
         new_view, consumed = _read_asn1_set(
             self._view,
             tag=tag,
@@ -213,6 +329,23 @@ class ASN1Reader:
         header: t.Optional[ASN1Header] = None,
         hint: t.Optional[str] = None,
     ) -> ASN1Reader:
+        """Reads an ASN.1 SEQUENCE or SEQUENCE_OF value.
+
+        The returned reader can be used to then read the values inside the
+        sequence.
+
+        Args:
+            tag: The tag to validate with, defaults to the SEQUENCE/SEQUENCE_OF
+                universal tag.
+            header: Optional header from :func:`peek_header` to make the
+                extraction more efficient.
+            hint: A hint used in error messages to display what this step was
+                used for.
+
+        Returns:
+            ASN1Reader: The ASN.1 reader object that can be used to read the
+                sequence elements.
+        """
         new_view, consumed = _read_asn1_sequence(
             self._view,
             tag=tag,
@@ -227,6 +360,17 @@ class ASN1Reader:
 
 
 class ASN1Writer:
+    """ASN.1 value writer.
+
+    Class used to write ASN.1 data into an internal buffer. This data can then
+    be retrieved using :func:`get_data`. It provides a nice helper to easily
+    accumulate multiple values in one object.
+
+    Args:
+        tag: Optional tag to used when in a sequence/set writer.
+        parent: The parent writer used when in a sequence/set writer.
+    """
+
     def __init__(
         self,
         *,
@@ -261,6 +405,25 @@ class ASN1Writer:
         self,
         tag: t.Optional[ASN1Tag] = None,
     ) -> ASN1Writer:
+        """Get new writer for a SEQUENCE or SEQUENCE_OF value.
+
+        Gets a new writer to start writing values inside a sequence or sequence
+        of object. Make sure to wrap the writer in a with statement to ensure
+        the sequence is closed and written back to the parent writer.
+
+        Examples:
+            .. code-block:: python
+
+                with writer.push_sequence() as seq_writer:
+                    seq_writer.write_octet_string(b"foo")
+
+        Args:
+            tag: Optional tag to mark the sequence/sequence_of with.
+
+        Returns:
+            ASN1Writer: The writer object that can be used to write the
+            sequence elements.
+        """
         if not tag:
             tag = ASN1Tag.universal_tag(TypeTagNumber.SEQUENCE, is_constructed=True)
         return ASN1Writer(tag=tag, parent=self)
@@ -271,6 +434,25 @@ class ASN1Writer:
         self,
         tag: t.Optional[ASN1Tag] = None,
     ) -> ASN1Writer:
+        """Get new writer for a SET or SET_OF value.
+
+        Gets a new writer to start writing values inside a set or set of
+        object. Make sure to wrap the writer in a with statement to ensure
+        the sequence is closed and written back to the parent writer.
+
+        Examples:
+            .. code-block:: python
+
+                with writer.push_set() as seq_writer:
+                    seq_writer.write_octet_string(b"foo")
+
+        Args:
+            tag: Optional tag to mark the sequence/sequence_of with.
+
+        Returns:
+            ASN1Writer: The writer object that can be used to write the
+            set elements.
+        """
         if not tag:
             tag = ASN1Tag.universal_tag(TypeTagNumber.SET, is_constructed=True)
         return ASN1Writer(tag=tag, parent=self)
@@ -282,6 +464,15 @@ class ASN1Writer:
         value: bool,
         tag: t.Optional[ASN1Tag] = None,
     ) -> None:
+        """Write an ASN.1 BOOLEAN value.
+
+        Writes a boolean value to the current writer.
+
+        Args:
+            value: The bool to write.
+            tag: Optional tag to use with the value, defaults to the BOOLEAN
+                universal tag.
+        """
         self._data.extend(_pack_asn1_boolean(value, tag=tag))
 
     def write_enumerated(
@@ -289,6 +480,15 @@ class ASN1Writer:
         value: int,
         tag: t.Optional[ASN1Tag] = None,
     ) -> None:
+        """Write an ASN.1 ENUMEATES value.
+
+        Writes a enumerated value to the current writer.
+
+        Args:
+            value: The enumerated/int to write.
+            tag: Optional tag to use with the value, defaults to the ENUMERATED
+                universal tag.
+        """
         self._data.extend(_pack_asn1_enumerated(value, tag=tag))
 
     def write_integer(
@@ -296,6 +496,15 @@ class ASN1Writer:
         value: int,
         tag: t.Optional[ASN1Tag] = None,
     ) -> None:
+        """Write an ASN.1 INTEGER value.
+
+        Writes an int value to the current writer.
+
+        Args:
+            value: The int to write.
+            tag: Optional tag to use with the value, defaults to the INTEGER
+                universal tag.
+        """
         self._data.extend(_pack_asn1_integer(value, tag=tag))
 
     def write_octet_string(
@@ -303,9 +512,27 @@ class ASN1Writer:
         value: bytes,
         tag: t.Optional[ASN1Tag] = None,
     ) -> None:
+        """Write an ASN.1 OCTET_STRING value.
+
+        Writes a bytes string value to the current writer.
+
+        Args:
+            value: The bool to write.
+            tag: Optional tag to use with the value, defaults to the
+                OCTET_STRING universal tag.
+        """
         self._data.extend(_pack_asn1_octet_string(value, tag=tag))
 
     def get_data(self) -> bytearray:
+        """Gets the data written to the writer.
+
+        This is used to get the final ASN.1 value after all the values have
+        been written to it. It cannot be called on a child writer returned by
+        push_sequence or push_set.
+
+        Returns:
+            bytearray: The data that has been written.
+        """
         if self._parent or self._tag:
             raise TypeError("Cannot all get_data() on child ASN1 writer")
 

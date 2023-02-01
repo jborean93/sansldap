@@ -485,7 +485,7 @@ class SearchRequest(LDAPMessage, Request):
         controls: A list of controls associated with the message.
         base_object: The name of the base object entry (or empty string for
             root) which the search is to be performed.
-        scope: The scope of the searched. See :class:`SearchScope` for more
+        scope: The scope of the search. See :class:`SearchScope` for more
             details.
         deref_aliases: Indicates how alias entries are to be dereferenced, see
             :class:`DereferencingPolicy` for more details.
