@@ -8,7 +8,7 @@ import pathlib
 
 import pytest
 
-from .examples.client_asyncio import LDAPClient, create_ldap_client
+from .examples.asyncio.client import LDAPClient, create_ldap_client
 
 
 def get_test_data(name: str) -> bytes:

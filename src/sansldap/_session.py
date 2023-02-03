@@ -25,6 +25,7 @@ from ._messages import (
     Request,
     Response,
     SearchRequest,
+    SearchResultDone,
     SearchScope,
     UnbindRequest,
     unpack_ldap_message,
@@ -129,7 +130,6 @@ class LDAPSession:
             filter=FilterOptions(string_encoding=string_encoding),
         )
         self._incoming_buffer = bytearray()
-        self._incoming_msgs: t.Dict[int, LDAPMessage] = {}
 
     def data_to_send(
         self,
@@ -152,27 +152,34 @@ class LDAPSession:
             amount = len(self._outgoing_buffer)
 
         data = bytes(self._outgoing_buffer[:amount])
-        self._data_to_send = self._outgoing_buffer[amount:]
+        self._outgoing_buffer = self._outgoing_buffer[amount:]
 
         return data
 
     def receive(
         self,
         data: t.Union[bytes, bytearray, memoryview],
-    ) -> None:
+    ) -> t.List[LDAPMessage]:
         """Receive data to process.
 
         Receives the data from the peer and unpack the messages found into
-        LDAPMessages. Any LDAP payloads received will be stored internally
-        retrieved by :func:`next_event`. A ProtocolError indicates something
-        fatal occurred when trying to parse the incoming data and the
-        connection is no longer in a valid state. The caller SHOULD send the
-        notice of disconnection payload available in :func:`data_to_send` and
-        MUST close the underlying connection. A ProtocolError does not include
-        a valid LDAPMessage response with a result code that is not SUCCESS.
+        LDAPMessages. Any complete LDAP messages received will be returned and
+        any remaining data will be stored in an internal buffer.A ProtocolError
+        indicates something fatal has occurred when trying to parse the
+        incoming data and the connection is no longer in a valid state. The
+        caller SHOULD send the notice of disconnection payload available in
+        :func:`data_to_send` and MUST close the underlying connection.
+
+        Note:
+            A ProtocolError is not raised when receiving a valid LDAP response
+            with a result code that is not ``SUCCESS``. Only critical errors
+            where the session is no longer viable will raise this error.
 
         Args:
             data: The data to process.
+
+        Returns:
+            t.List[LDAPMessage]: A list of messages that have been unpacked.
 
         Raises:
             ProtocolError: A protocol violation occurred and the connection is
@@ -181,12 +188,11 @@ class LDAPSession:
         if self.state == SessionState.CLOSED:
             raise ProtocolError("Cannot receive more data on a closed LDAP session")
 
-        # If there is leftover data in the buffer then use that, otherwise
-        # try to unpack directly from the input to avoid copying it if it's not
-        # needed.
+        incoming_msgs: t.List[LDAPMessage] = []
         try:
-            incoming_msgs: t.List[LDAPMessage] = []
-
+            # If there is leftover data in the buffer then use that, otherwise
+            # try to unpack directly from the input to avoid copying it if it's
+            # not needed.
             if self._incoming_buffer:
                 self._incoming_buffer.extend(data)
                 reader = ASN1Reader(self._incoming_buffer)
@@ -226,7 +232,7 @@ class LDAPSession:
                 elif isinstance(msg, UnbindRequest):
                     raise ProtocolError("Received unbind request, connection is closed", request=msg)
 
-                self._add_incoming_message(msg)
+                self._process_incoming_message(msg)
 
         except (ValueError, NotImplementedError) as e:
             raise ProtocolError(f"Received invalid data from the peer, connection closing: {e}") from e
@@ -236,31 +242,7 @@ class LDAPSession:
             self._outstanding_requests = set()
             raise
 
-    def next_event(
-        self,
-        message_id: t.Optional[int] = None,
-    ) -> t.Optional[LDAPMessage]:
-        """Get the next LDAP message received.
-
-        Gets the next LDAP message received or the message matching the
-        message_id if specified.
-
-        Args:
-            message_id: Optionally get the next LDAP message for the message id
-                specified. If not set then the next LDAP message is returned.
-
-        Returns:
-            Optional[LDAPMessage]: The next LDAP message, or None if there are
-            no messages.
-        """
-        if message_id is not None:
-            return self._incoming_msgs.pop(message_id, None)
-
-        elif len(self._incoming_msgs):
-            message_id = next(iter(self._incoming_msgs.keys()))
-            return self._incoming_msgs.pop(message_id)
-
-        return None
+        return incoming_msgs
 
     def register_auth_credential(
         self,
@@ -344,11 +326,11 @@ class LDAPSession:
         self._outstanding_requests = set()
         self.state = SessionState.CLOSED
 
-    def _add_incoming_message(
+    def _process_incoming_message(
         self,
         msg: LDAPMessage,
     ) -> None:
-        self._incoming_msgs[msg.message_id] = msg
+        pass
 
     def _send(
         self,
@@ -379,6 +361,7 @@ class LDAPClient(LDAPSession):
     def __init__(self) -> None:
         super().__init__()
         self._message_counter = 1
+        self._search_requests: t.Set[int] = set()
 
     def bind_simple(
         self,
@@ -616,12 +599,15 @@ class LDAPClient(LDAPSession):
             filter=filter or FilterPresent("objectClass"),
             attributes=attributes or [],
         )
-        return self._send(msg)
+        msg_id = self._send(msg)
+        self._search_requests.add(msg_id)
+
+        return msg_id
 
     def receive(
         self,
         data: t.Union[bytes, bytearray, memoryview],
-    ) -> None:
+    ) -> t.List[LDAPMessage]:
         try:
             return super().receive(data)
         except ProtocolError as e:
@@ -640,12 +626,20 @@ class LDAPClient(LDAPSession):
 
             raise
 
-    def _add_incoming_message(
+    def _process_incoming_message(
         self,
         msg: LDAPMessage,
     ) -> None:
+        remove_id = True
         if not isinstance(msg, Response):
             raise ProtocolError(f"Received an LDAP message that is not a response {type(msg).__name__}, cannot process")
+
+        elif msg.message_id in self._search_requests:
+            if isinstance(msg, SearchResultDone):
+                self._search_requests.remove(msg.message_id)
+
+            else:
+                remove_id = False
 
         elif msg.message_id not in self._outstanding_requests:
             raise ProtocolError(f"Received unexpected message id response {msg.message_id} from server")
@@ -653,9 +647,10 @@ class LDAPClient(LDAPSession):
         if isinstance(msg, BindResponse) and msg.result.result_code == LDAPResultCode.SUCCESS:
             self.state = SessionState.OPENED
 
-        self._outstanding_requests.remove(msg.message_id)
+        if remove_id:
+            self._outstanding_requests.remove(msg.message_id)
 
-        return super()._add_incoming_message(msg)
+        return super()._process_incoming_message(msg)
 
     def _send(
         self,
@@ -778,7 +773,7 @@ class LDAPServer(LDAPSession):
     def receive(
         self,
         data: t.Union[bytes, bytearray, memoryview],
-    ) -> None:
+    ) -> t.List[LDAPMessage]:
         try:
             return super().receive(data)
         except ProtocolError as e:
@@ -799,7 +794,7 @@ class LDAPServer(LDAPSession):
 
             raise
 
-    def _add_incoming_message(
+    def _process_incoming_message(
         self,
         msg: LDAPMessage,
     ) -> None:
@@ -816,7 +811,7 @@ class LDAPServer(LDAPSession):
             self.state = SessionState.OPENED
 
         self._outstanding_requests.add(msg.message_id)
-        super()._add_incoming_message(msg)
+        super()._process_incoming_message(msg)
 
     def _send(
         self,

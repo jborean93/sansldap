@@ -194,3 +194,8 @@ def test_filter_approx_match_unpack() -> None:
 # def test_filter_extensible_match_unpack() -> None:
 #     data = base64.b64decode("")
 #     actual = unpack_filter(data)
+
+
+def test_filter_from_string() -> None:
+    actual = f.LDAPFilter.from_string("(&(objectClass=*)(sAMAccountName=user))")
+    a = ""

@@ -3,10 +3,357 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
+import re
 import typing as t
 
 from .asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass
+
+_HEX_PATTERN = re.compile("^[a-fA-F0-9]{2}$")
+_LDAP_ESCAPE_PATTERN = re.compile(r"(\\.{,2})".encode("utf-8"))
+
+
+class FilterSyntaxError(ValueError):
+    def __init__(
+        self,
+        msg: str,
+        filter: str,
+        start: int,
+        end: int,
+    ) -> None:
+        super().__init__(msg)
+        self.filter = filter
+        self.start = start
+        self.end = end
+
+
+def _unpack_filter(
+    filter: str,
+    view: memoryview,
+    offset: int,
+    length: int,
+) -> t.Tuple[LDAPFilter, int]:
+    # Using a memoryview means we avoid copying the string while slicing. The
+    # downside is that it's a byte string (UTF-8 encoded).
+    current_view = view[offset : offset + length]
+
+    parens_start: t.Optional[int] = None
+    parsed_filter: t.Optional[LDAPFilter] = None
+
+    read = 0
+    while read < len(current_view):
+        current_char = chr(current_view[read])
+
+        if current_char == " ":
+            read += 1
+            continue
+
+        if current_char == ")":
+            if parens_start is None:
+                raise FilterSyntaxError(
+                    "Unbalanced closing ')' without a starting '('",
+                    filter=filter,
+                    start=offset + read,
+                    end=offset + read + 1,
+                )
+
+            parens_start = None
+            read += 1
+            break
+
+        elif parens_start is not None:
+            # LDAP filter inside parens - '(objectClass=*)' or
+            # '(&(test)(value))'. Determine whether it is a simple value or
+            # conditional value and parse accordingly. First make sure there
+            # isn't a double filter like '((objectClass=*))' or that it didn't
+            # just parse one '(!(foo=*)!(bar=*))'.
+            if current_char == "(":
+                raise FilterSyntaxError(
+                    "Nested '(' without filter condition",
+                    filter=filter,
+                    start=offset + read,
+                    end=offset + read + 1,
+                )
+
+            sub_filter_offset = offset + read
+            sub_filter_length = length - read
+            if current_char in ["!", "&", "|"]:
+                # LDAP filter = '(&(foo=bar)(hello=world))
+                parsed_filter, sub_read = _unpack_complex_filter(
+                    filter,
+                    view,
+                    offset=sub_filter_offset,
+                    length=sub_filter_length,
+                )
+
+            else:
+                # LDAP filter = '(foo=bar)'
+                parsed_filter, sub_read = _unpack_simple_filter(
+                    filter,
+                    view,
+                    offset=sub_filter_offset,
+                    length=sub_filter_length,
+                )
+
+            read += sub_read
+
+        elif current_char == "(":
+            parens_start = read
+            read += 1
+
+        else:
+            # An LDAP filter that is not surrounded by () - 'objectClass=*'
+            parsed_filter, simple_read = _unpack_simple_filter(
+                filter,
+                view,
+                offset=offset + read,
+                length=length - read,
+            )
+            read += simple_read
+            break
+
+    if parens_start is not None:
+        raise FilterSyntaxError(
+            "Unbalanced starting '(' without a closing ')'",
+            filter=filter,
+            start=offset + (parens_start or 0),
+            end=offset + length,
+        )
+
+    if parsed_filter is None:
+        raise FilterSyntaxError(
+            "No filter found",
+            filter=filter,
+            start=offset,
+            end=offset + length,
+        )
+
+    return parsed_filter, read
+
+
+def _unpack_complex_filter(
+    filter: str,
+    view: memoryview,
+    offset: int,
+    length: int,
+) -> t.Tuple[LDAPFilter, int]:
+    current_view = view[offset : offset + length]
+    parsed_filters: t.List[LDAPFilter] = []
+    complex_type = chr(current_view[0])
+
+    read = 1
+    while read < len(current_view):
+        current_char = chr(current_view[read])
+
+        if current_char == " ":
+            read += 1
+            continue
+
+        if current_char == "(":
+            if complex_type == "!" and len(parsed_filters):
+                # LDAP filter - '!(foo=bar)(hello=*)...'
+                raise FilterSyntaxError(
+                    "Multiple filters found for not '!' expression",
+                    filter=filter,
+                    start=offset,
+                    end=offset + length + 1,
+                )
+
+            parsed_filter, filter_read = _unpack_filter(
+                filter,
+                view,
+                offset + read,
+                length - read - 1,
+            )
+            parsed_filters.append(parsed_filter)
+
+            read += filter_read
+
+        elif current_char == ")":
+            break
+
+        elif len(parsed_filters) > 0:
+            # LDAP filter = '&(foo=bar)hello=world'
+            raise FilterSyntaxError(
+                "Expecting ')' to end complex filter expression",
+                filter=filter,
+                start=offset + read,
+                end=offset + read + 1,
+            )
+
+        else:
+            # LDAP filter = '|foo=bar'
+            raise FilterSyntaxError(
+                "Expecting '(' to start after qualifier in complex filter expression",
+                filter=filter,
+                start=offset + read,
+                end=offset + read + 1,
+            )
+
+    if not parsed_filters:
+        raise FilterSyntaxError(
+            "No filter value found after conditional",
+            filter=filter,
+            start=offset,
+            end=offset + length,
+        )
+
+    if complex_type == "!":
+        return FilterNot(parsed_filters[0]), read
+
+    elif complex_type == "&":
+        return FilterAnd(parsed_filters), read
+
+    else:
+        return FilterOr(parsed_filters), read
+
+
+def _unpack_simple_filter(
+    filter: str,
+    view: memoryview,
+    offset: int,
+    length: int,
+) -> t.Tuple[LDAPFilter, int]:
+    current_view = view[offset : offset + length]
+    read = 0
+
+    equals_idx = -1
+    for i in range(len(current_view)):
+        if chr(current_view[i]) == "=":
+            equals_idx = i
+            break
+
+    if equals_idx == 0:
+        raise FilterSyntaxError(
+            "Simple filter value must not start with '='",
+            filter=filter,
+            start=offset,
+            end=offset + 1,
+        )
+
+    elif equals_idx == -1:
+        raise FilterSyntaxError(
+            "Simple filter missing '=' character",
+            filter=filter,
+            start=offset,
+            end=offset + length,
+        )
+
+    elif equals_idx == length - 1:
+        raise FilterSyntaxError(
+            "Simple filter value is not present after '='",
+            filter=filter,
+            start=offset,
+            end=offset + length,
+        )
+
+    filter_type = chr(current_view[equals_idx - 1])
+    if filter_type == ":":
+        # FilterExtensibleMatch
+        raise NotImplementedError("extensible filter type")
+
+    else:
+        attribute_end = equals_idx
+        if filter_type in ["<", ">", "~"]:
+            attribute_end -= 1
+
+        attribute = current_view[:attribute_end].tobytes().decode("utf-8")
+        # FIXME: Check with regex for valid attribute value
+
+        read += equals_idx + 1
+        value_length = len(current_view) - read
+        for i in range(value_length):
+            if chr(current_view[i + read]) == ")":
+                value_length = i
+                break
+
+        b_value = current_view[read : read + value_length].tobytes()
+        if filter_type in ["<", ">", "~"]:
+            raw_value = _unpack_filter_value(
+                filter,
+                b_value,
+                offset + read,
+                read + value_length,
+            )
+            read += len(b_value)
+
+            if filter_type == "<":
+                return FilterLessOrEqual(attribute, raw_value), read
+
+            elif filter_type == ">":
+                return FilterGreaterOrEqual(attribute, raw_value), read
+
+            else:
+                return FilterApproxMatch(attribute, raw_value), read
+
+        elif b_value == b"*":
+            return FilterPresent(attribute), read + 1
+
+        elif b"*" in b_value:
+            # FilterSubstrings
+            raise NotImplementedError()
+
+        else:
+            raw_value = _unpack_filter_value(
+                filter,
+                b_value,
+                offset + read,
+                read + value_length,
+            )
+            return FilterEquality(attribute, raw_value), read + len(b_value)
+
+
+def _unpack_filter_substrings(
+    filter: str,
+    view: memoryview,
+    offset: int,
+    length: int,
+) -> FilterSubstrings:
+    raise NotImplementedError()
+
+
+def _unpack_filter_value(
+    filter: str,
+    value: bytes,
+    offset: int,
+    length: int,
+) -> bytes:
+    """Unpack a filter value.
+
+    Unpacks the raw filter value string into the bytes it represents. This will
+    escape the ocurrences of '\\[0-9a-fA-F]{2}' with the raw byte value that
+    hex escape represents.
+
+    Args:
+        filter: The whole filter this is included in.
+        value: The value to unpack.
+        offset: The offset of the value in the filter.
+        length: The length of the value in the filter.
+
+    Returns:
+        bytes: The unpacked bytes of the value.
+    """
+
+    def rplcr(matchobj: re.Match) -> bytes:
+        raw_value = matchobj.group(1)[1:].decode("utf-8", errors="surrogateescape")
+        if _HEX_PATTERN.match(raw_value):
+            return base64.b16decode(raw_value.upper())
+
+        else:
+            raise ValueError(f"Invalid hex characters following \\ '{raw_value}', requires 2 [0-9a-fA-F]")
+
+    try:
+        # As we are already using bytes, we can just use regex on that byte
+        # string rather than go back to a string.
+        return _LDAP_ESCAPE_PATTERN.sub(rplcr, value)
+    except ValueError as e:
+        raise FilterSyntaxError(
+            str(e),
+            filter=filter,
+            start=offset,
+            end=offset + length,
+        )
 
 
 @dataclasses.dataclass
@@ -130,6 +477,36 @@ class LDAPFilter:
                 packed.
         """
         raise NotImplementedError()
+
+    @classmethod
+    def from_string(
+        cls,
+        filter: str,
+    ) -> LDAPFilter:
+        """Convert an LDAP filter string to a filter object.
+
+        Converts the string provided into an LDAPFilter object based on the
+        standard LDAPFilter string rules. This only supports the LDAP filters
+        as defined in RFC 4511.
+
+        Args:
+            filter: The LDAP filter string to convert.
+
+        Returns:
+            LDAPFilter: The converted filter.
+        """
+        b_filter = filter.encode("utf-8")
+        filter_view = memoryview(b_filter)
+        filter_obj, consumed = _unpack_filter(filter, filter_view, 0, len(b_filter))
+        if consumed < len(b_filter):
+            raise FilterSyntaxError(
+                "Extra data found at filter end",
+                filter=filter,
+                start=consumed,
+                end=len(b_filter),
+            )
+
+        return filter_obj
 
     @classmethod
     def unpack(

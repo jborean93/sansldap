@@ -3,13 +3,26 @@
 
 import os
 
-from .examples.client_asyncio import LDAPClient
+import sansldap
+
+from .examples.asyncio.client import LDAPClient
 
 
 async def test_simple_bind(client: LDAPClient) -> None:
-    username = os.environ.get("SANSLDAP_USERNAME", None)
-    password = os.environ.get("SANSLDAP_PASSWORD", None)
-    # await client.bind_simple(username, password=password)
-    await client.search_request("")
+    async with client:
+        username = os.environ.get("SANSLDAP_USERNAME", None)
+        password = os.environ.get("SANSLDAP_PASSWORD", None)
+        await client.bind_simple(username, password=password)
+
+        async for res in client.search_request(
+            "DC=domain,DC=test",
+            filter=sansldap.FilterEquality("objectClass", b"user"),
+            scope=sansldap.SearchScope.SUBTREE,
+            attributes=[
+                "sAMAccountName",
+                "userPrincipalName",
+            ],
+        ):
+            a = ""
 
     return
