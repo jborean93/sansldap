@@ -1,7 +1,9 @@
 black==23.1.0
+cryptography
 isort==5.11.5  # Last version supported by Python 3.7
 mypy==0.991
 pre-commit
+pyspnego[kerberos]
 pytest
 pytest-asyncio
 pytest-cov

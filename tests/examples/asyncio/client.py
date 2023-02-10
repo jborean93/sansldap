@@ -9,6 +9,8 @@ import typing as t
 
 import sansldap
 
+from .sasl import SaslProvider
+
 MessageType = t.TypeVar("MessageType", bound=sansldap.LDAPMessage)
 
 
@@ -25,7 +27,7 @@ async def create_ldap_client(
         ssl=ssl_context,
     )
 
-    return LDAPClient(reader, writer)
+    return LDAPClient(server, reader, writer)
 
 
 class LDAPResultError(Exception):
@@ -97,19 +99,22 @@ class ResponseHandler(t.Generic[MessageType]):
 class LDAPClient:
     def __init__(
         self,
+        server: str,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        self.protocol = sansldap.LDAPClient()
+        self.server = server
+        self._protocol = sansldap.LDAPClient()
 
         self._reader = reader
         self._writer = writer
         self._reader_task = asyncio.create_task(self._read_loop())
         self._response_handler: t.List[ResponseHandler] = []
+        self._sasl_provider: t.Optional[SaslProvider] = None
 
     @property
     def state(self) -> sansldap.SessionState:
-        return self.protocol.state
+        return self._protocol.state
 
     async def __aenter__(self) -> LDAPClient:
         return self
@@ -121,23 +126,45 @@ class LDAPClient:
     ) -> None:
         await self.close()
 
+    async def bind_sasl(
+        self,
+        provider: SaslProvider,
+    ) -> None:
+        tls_channel: t.Optional[ssl.SSLObject] = None
+        in_token: t.Optional[bytes] = None
+
+        while True:
+            out_token = provider.step(in_token=in_token, tls_channel=tls_channel)
+            if out_token is None:
+                break
+
+            msg_id = self._protocol.bind_sasl(provider.mechanism, cred=out_token)
+            response = await self._write_and_wait_one(msg_id, sansldap.BindResponse)
+
+            if response.result.result_code not in [
+                sansldap.LDAPResultCode.SUCCESS,
+                sansldap.LDAPResultCode.SASL_BIND_IN_PROGRESS,
+            ]:
+                raise LDAPResultError("SASL bind failed", response.result)
+
+            in_token = response.server_sasl_creds
+
+        if response.result.result_code != sansldap.LDAPResultCode.SUCCESS:
+            raise LDAPResultError("SASL bind failed", response.result)
+
+        self._sasl_provider = provider
+
     async def bind_simple(
         self,
         username: t.Optional[str] = None,
         password: t.Optional[str] = None,
     ) -> None:
-        msg_id = self.protocol.bind_simple(username, password)
+        msg_id = self._protocol.bind_simple(username, password)
         response = await self._write_and_wait_one(msg_id, sansldap.BindResponse)
 
         self._valid_result(response.result, "simple bind failed")
 
     async def close(self) -> None:
-        if self.state in [sansldap.SessionState.BINDING, sansldap.SessionState.OPENED]:
-            self.protocol.unbind()
-            data = self.protocol.data_to_send()
-            self._writer.write(data)
-            await self._writer.drain()
-
         self._writer.close()
         await self._writer.wait_closed()
         await self._reader_task
@@ -160,7 +187,7 @@ class LDAPClient:
         elif filter:
             ldap_filter = sansldap.LDAPFilter.from_string(filter)
 
-        msg_id = self.protocol.search_request(
+        msg_id = self._protocol.search_request(
             base_object=base_object,
             scope=scope,
             dereferencing_policy=dereferencing_policy,
@@ -191,16 +218,58 @@ class LDAPClient:
         finally:
             self._unregister_response_handler(handler)
 
+    async def start_tls(
+        self,
+        options: ssl.SSLContext,
+        *,
+        server_hostname: t.Optional[str] = None,
+        ssl_handshake_timeout: t.Optional[int] = None,
+    ) -> None:
+        # start_tls was added in Python 3.11
+        if not hasattr(self._writer, "start_tls"):
+            raise Exception("Need Python 3.11 for StartTLS")
+
+        msg_id = self._protocol.extended_request(sansldap.ExtendedOperations.LDAP_START_TLS.value)
+        response = await self._write_and_wait_one(msg_id, sansldap.ExtendedResponse)
+        self._valid_result(response.result, "StartTLS failed")
+
+        await self._writer.start_tls(
+            options,
+            server_hostname=server_hostname,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+        )
+
+    async def whoami(self) -> str:
+        msg_id = self._protocol.extended_request("1.3.6.1.4.1.4203.1.11.3")
+        response = await self._write_and_wait_one(msg_id, sansldap.ExtendedResponse)
+        self._valid_result(response.result, "whoami request failed")
+
+        return response.value.decode("utf-8") if response.value else ""
+
     async def _read_loop(self) -> None:
+        data_buffer = bytearray()
         while True:
             try:
                 resp = await self._reader.read(4096)
                 if not resp:
                     raise Exception("LDAP connection has been shutdown")
 
-                for msg in self.protocol.receive(resp):
-                    for handler in self._response_handler:
-                        await handler.append(msg)
+                data_buffer.extend(resp)
+
+                while data_buffer:
+                    if self._sasl_provider and False:
+                        dec_data, enc_len = self._sasl_provider.unwrap(data_buffer)
+                        if enc_len == 0:
+                            continue
+
+                        data_buffer = data_buffer[enc_len:]
+                    else:
+                        dec_data = bytes(data_buffer)
+                        data_buffer = bytearray()
+
+                    for msg in self._protocol.receive(dec_data):
+                        for handler in self._response_handler:
+                            await handler.append(msg)
 
             except sansldap.ProtocolError as e:
                 if e.response:
@@ -258,6 +327,9 @@ class LDAPClient:
             self._unregister_response_handler(handler)
 
     async def _write_msg(self) -> None:
-        data = self.protocol.data_to_send()
+        data = self._protocol.data_to_send()
+        if self._sasl_provider:
+            data = self._sasl_provider.wrap(data)
+
         self._writer.write(data)
         await self._writer.drain()

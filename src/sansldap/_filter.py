@@ -10,22 +10,64 @@ import typing as t
 
 from .asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass
 
+_ATTRIBUTE_PATTERN = re.compile(
+    r"""^
+(?:
+    (?:
+        # Alphanumeric with hyphen (must start with alpha)
+        [a-zA-Z][a-zA-Z0-9\-]*
+    )
+    | # or
+    (?:
+        # OID string
+        (?:
+            # Number without leading 0 (except 0 itself)
+            (?:[0-9])|(?:[1-9][0-9]*)
+        )
+        (?:
+            # Optionally repeated but with . as separator
+            \.(?:(?:[0-9])|(?:[1-9][0-9]*))
+        )*
+    )
+)
+(?:
+    # Optional attr options start with ; and are alphanumeric with hyphen
+    ;[a-zA-Z0-9\-]+
+)*
+$""",
+    re.VERBOSE,
+)
 _HEX_PATTERN = re.compile("^[a-fA-F0-9]{2}$")
 _LDAP_ESCAPE_PATTERN = re.compile(r"(\\.{,2})".encode("utf-8"))
 
+# (), ), *, \, control chars, any non ASCII chars need to be escaped
+_STRING_ESCAPE_PATTERN = re.compile(r"[\x00-\x1F\(\)*\\\x7F-\xFF]".encode("utf-8"))
+
 
 class FilterSyntaxError(ValueError):
+    """Exception used for LDAP filter syntax erros.
+
+    This exception is raised when the code has failed to parse the LDAP filter
+    string provided. It provides the full filter used as well as the offset and
+    length of the subset that failed to be parsed.
+
+    Args:
+        msg: Details of the syntax error.
+        offset: The offset of the filter provided that failed.
+        length: The length after offset that was part of the failure.
+    """
+
     def __init__(
         self,
         msg: str,
         filter: str,
-        start: int,
-        end: int,
+        offset: int,
+        length: int,
     ) -> None:
         super().__init__(msg)
         self.filter = filter
-        self.start = start
-        self.end = end
+        self.offset = offset
+        self.length = length
 
 
 def _unpack_filter(
@@ -34,6 +76,20 @@ def _unpack_filter(
     offset: int,
     length: int,
 ) -> t.Tuple[LDAPFilter, int]:
+    """Unpacks a filter value.
+
+    Unpacks the filter value from the provided data.
+
+    Args:
+        filter: The full LDAPFilter string being processed.
+        view: The bytes view of the full LDAPFilter string being processed.
+        offset: The offset in the view that needs to be processed as a complex
+            filter.
+        length: The length from offset in the view that needs to be processed.
+
+    Returns:
+        Tuple[LDAPFilter, int]: The filter and bytes consumed.
+    """
     # Using a memoryview means we avoid copying the string while slicing. The
     # downside is that it's a byte string (UTF-8 encoded).
     current_view = view[offset : offset + length]
@@ -54,8 +110,8 @@ def _unpack_filter(
                 raise FilterSyntaxError(
                     "Unbalanced closing ')' without a starting '('",
                     filter=filter,
-                    start=offset + read,
-                    end=offset + read + 1,
+                    offset=offset + read,
+                    length=1,
                 )
 
             parens_start = None
@@ -70,10 +126,10 @@ def _unpack_filter(
             # just parse one '(!(foo=*)!(bar=*))'.
             if current_char == "(":
                 raise FilterSyntaxError(
-                    "Nested '(' without filter condition",
+                    "Nested '(' without filter conditional",
                     filter=filter,
-                    start=offset + read,
-                    end=offset + read + 1,
+                    offset=offset + read,
+                    length=1,
                 )
 
             sub_filter_offset = offset + read
@@ -117,16 +173,16 @@ def _unpack_filter(
         raise FilterSyntaxError(
             "Unbalanced starting '(' without a closing ')'",
             filter=filter,
-            start=offset + (parens_start or 0),
-            end=offset + length,
+            offset=offset + (parens_start or 0),
+            length=length - (offset + (parens_start or 0)),
         )
 
     if parsed_filter is None:
         raise FilterSyntaxError(
             "No filter found",
             filter=filter,
-            start=offset,
-            end=offset + length,
+            offset=offset,
+            length=length,
         )
 
     return parsed_filter, read
@@ -138,6 +194,20 @@ def _unpack_complex_filter(
     offset: int,
     length: int,
 ) -> t.Tuple[LDAPFilter, int]:
+    """Unpacks a complex filter value.
+
+    Unpacks the complex filter value, and, or, not, from the provided data.
+
+    Args:
+        filter: The full LDAPFilter string being processed.
+        view: The bytes view of the full LDAPFilter string being processed.
+        offset: The offset in the view that needs to be processed as a complex
+            filter.
+        length: The length from offset in the view that needs to be processed.
+
+    Returns:
+        Tuple[LDAPFilter, int]: The filter and bytes consumed.
+    """
     current_view = view[offset : offset + length]
     parsed_filters: t.List[LDAPFilter] = []
     complex_type = chr(current_view[0])
@@ -156,8 +226,8 @@ def _unpack_complex_filter(
                 raise FilterSyntaxError(
                     "Multiple filters found for not '!' expression",
                     filter=filter,
-                    start=offset,
-                    end=offset + length + 1,
+                    offset=offset,
+                    length=length,
                 )
 
             parsed_filter, filter_read = _unpack_filter(
@@ -178,8 +248,8 @@ def _unpack_complex_filter(
             raise FilterSyntaxError(
                 "Expecting ')' to end complex filter expression",
                 filter=filter,
-                start=offset + read,
-                end=offset + read + 1,
+                offset=offset + read,
+                length=1,
             )
 
         else:
@@ -187,16 +257,16 @@ def _unpack_complex_filter(
             raise FilterSyntaxError(
                 "Expecting '(' to start after qualifier in complex filter expression",
                 filter=filter,
-                start=offset + read,
-                end=offset + read + 1,
+                offset=offset + read,
+                length=1,
             )
 
     if not parsed_filters:
         raise FilterSyntaxError(
             "No filter value found after conditional",
             filter=filter,
-            start=offset,
-            end=offset + length,
+            offset=offset,
+            length=length,
         )
 
     if complex_type == "!":
@@ -215,6 +285,21 @@ def _unpack_simple_filter(
     offset: int,
     length: int,
 ) -> t.Tuple[LDAPFilter, int]:
+    """Unpacks a simple filter value.
+
+    Unpacks the simple filter value, equality, approx match, substrings, etc,
+    from the provided data.
+
+    Args:
+        filter: The full LDAPFilter string being processed.
+        view: The bytes view of the full LDAPFilter string being processed.
+        offset: The offset in the view that needs to be processed as a simple
+            filter.
+        length: The length from offset in the view that needs to be processed.
+
+    Returns:
+        Tuple[LDAPFilter, int]: The filter and bytes consumed.
+    """
     current_view = view[offset : offset + length]
     read = 0
 
@@ -228,89 +313,219 @@ def _unpack_simple_filter(
         raise FilterSyntaxError(
             "Simple filter value must not start with '='",
             filter=filter,
-            start=offset,
-            end=offset + 1,
+            offset=offset,
+            length=1,
         )
 
     elif equals_idx == -1:
         raise FilterSyntaxError(
             "Simple filter missing '=' character",
             filter=filter,
-            start=offset,
-            end=offset + length,
+            offset=offset,
+            length=length,
         )
 
     elif equals_idx == length - 1:
         raise FilterSyntaxError(
             "Simple filter value is not present after '='",
             filter=filter,
-            start=offset,
-            end=offset + length,
+            offset=offset,
+            length=length,
         )
 
     filter_type = chr(current_view[equals_idx - 1])
+    attribute_end = equals_idx
+    if filter_type in [":", ">", "<", "~"]:
+        if equals_idx == 1:
+            raise FilterSyntaxError(
+                "Filter must define an attribute name before the equal symbol",
+                filter=filter,
+                offset=offset,
+                length=length,
+            )
+        attribute_end -= 1
+    else:
+        filter_type == 0
+
+    attribute = current_view[:attribute_end].tobytes().decode("utf-8")
+    if filter_type != ":" and not _ATTRIBUTE_PATTERN.match(attribute):
+        raise FilterSyntaxError(
+            "Filter attribute is invalid",
+            filter=filter,
+            offset=offset,
+            length=attribute_end,
+        )
+
+    read += equals_idx + 1
+    value_offset = offset + read
+
+    value_length = len(current_view) - read
+    for i in range(value_length):
+        if chr(current_view[i + read]) == ")":
+            value_length = i
+            break
+
+    raw_value = current_view[read : read + value_length].tobytes()
+    read += value_length
+    if filter_type != 0 or b"*" not in raw_value:
+        b_value = _unpack_filter_value(
+            filter,
+            raw_value,
+            offset=value_offset,
+            length=value_length,
+        )
+    else:
+        b_value = raw_value
+
     if filter_type == ":":
-        # FilterExtensibleMatch
-        raise NotImplementedError("extensible filter type")
+        ext_attribute, for_dn, rule = _unpack_filter_extensible_header(
+            filter,
+            attribute,
+            offset=offset,
+            length=attribute_end,
+        )
+        return FilterExtensibleMatch(rule, ext_attribute, b_value, for_dn), read
+
+    elif filter_type == ">":
+        return FilterGreaterOrEqual(attribute, b_value), read
+
+    elif filter_type == "<":
+        return FilterLessOrEqual(attribute, b_value), read
+
+    elif filter_type == "~":
+        return FilterApproxMatch(attribute, b_value), read
+
+    elif raw_value == b"*":
+        return FilterPresent(attribute), read
+
+    elif b"*" in raw_value:
+        first, values, end = _unpack_filter_substrings_value(
+            filter,
+            b_value,
+            offset=value_offset,
+            length=value_length,
+        )
+
+        return FilterSubstrings(attribute, first, values, end), read
 
     else:
-        attribute_end = equals_idx
-        if filter_type in ["<", ">", "~"]:
-            attribute_end -= 1
-
-        attribute = current_view[:attribute_end].tobytes().decode("utf-8")
-        # FIXME: Check with regex for valid attribute value
-
-        read += equals_idx + 1
-        value_length = len(current_view) - read
-        for i in range(value_length):
-            if chr(current_view[i + read]) == ")":
-                value_length = i
-                break
-
-        b_value = current_view[read : read + value_length].tobytes()
-        if filter_type in ["<", ">", "~"]:
-            raw_value = _unpack_filter_value(
-                filter,
-                b_value,
-                offset + read,
-                read + value_length,
-            )
-            read += len(b_value)
-
-            if filter_type == "<":
-                return FilterLessOrEqual(attribute, raw_value), read
-
-            elif filter_type == ">":
-                return FilterGreaterOrEqual(attribute, raw_value), read
-
-            else:
-                return FilterApproxMatch(attribute, raw_value), read
-
-        elif b_value == b"*":
-            return FilterPresent(attribute), read + 1
-
-        elif b"*" in b_value:
-            # FilterSubstrings
-            raise NotImplementedError()
-
-        else:
-            raw_value = _unpack_filter_value(
-                filter,
-                b_value,
-                offset + read,
-                read + value_length,
-            )
-            return FilterEquality(attribute, raw_value), read + len(b_value)
+        return FilterEquality(attribute, b_value), read
 
 
-def _unpack_filter_substrings(
+def _unpack_filter_extensible_header(
     filter: str,
-    view: memoryview,
+    header: str,
     offset: int,
     length: int,
-) -> FilterSubstrings:
-    raise NotImplementedError()
+) -> t.Tuple[t.Optional[str], bool, t.Optional[str]]:
+    """Unpacks the extensible filter header.
+
+    Unpacks the extensible filter header, including the attribute, dn setting,
+    and rule.
+
+    Args:
+        filter: The full LDAP filter being process,
+        header: The header to unpack.
+        offset: The offset of the header in filter.
+        length: The length of the header in filter.
+
+    Returns:
+        Tuple[Optional[str], bool, Optional[str]]: The attribute, dn settings,
+        and rule from the header.
+    """
+    attribute: t.Optional[str] = None
+    rule: t.Optional[str] = None
+    for_dn = False
+
+    header_split = list(header.split(":"))
+    if header_split[0]:
+        if _ATTRIBUTE_PATTERN.match(header_split[0]):
+            attribute = header_split[0]
+        else:
+            raise FilterSyntaxError(
+                "Invalid extensible filter attribute",
+                filter=filter,
+                offset=offset,
+                length=length,
+            )
+
+    header_split.pop(0)
+
+    if header_split and header_split[0] == "dn":
+        for_dn = True
+        header_split.pop(0)
+
+    if header_split:
+        if _ATTRIBUTE_PATTERN.match(header_split[0]):
+            rule = header_split.pop(0)
+        else:
+            raise FilterSyntaxError(
+                "Invalid extensible filter rule",
+                filter=filter,
+                offset=offset,
+                length=length,
+            )
+
+    if header_split:
+        raise FilterSyntaxError(
+            "Extra data found in extensible filter header",
+            filter=filter,
+            offset=offset,
+            length=length,
+        )
+
+    return attribute, for_dn, rule
+
+
+def _unpack_filter_substrings_value(
+    filter: str,
+    value: bytes,
+    offset: int,
+    length: int,
+) -> t.Tuple[t.Optional[bytes], t.List[bytes], t.Optional[bytes]]:
+    """Unpack a filter substrings value.
+
+    Unpacks the raw filter substrings value into the first, any, and final
+    bytes it represents.
+
+    Args:
+        filter: The whole filter this is included in.
+        value: The value to unpack.
+        offset: The offset of the value in the filter.
+        length: The length of the value in the filter.
+
+    Returns:
+        Tuple[Optional[bytes], List[bytes], Optional[bytes]]: The first, and,
+        and final value of the substrings filter.
+    """
+    first: t.Optional[bytes] = None
+    values: t.List[bytes] = []
+    end: t.Optional[bytes] = None
+
+    value_split = value.split(b"*")
+    for idx, v in enumerate(value_split):
+        if idx == 0:
+            if v:
+                first = _unpack_filter_value(filter, v, offset, length)
+            continue
+
+        if idx == len(value_split) - 1:
+            if v:
+                end = _unpack_filter_value(filter, v, offset, length)
+            continue
+
+        if v:
+            values.append(_unpack_filter_value(filter, v, offset, length))
+
+        else:
+            raise FilterSyntaxError(
+                "Cannot have 2 consecutive '*' in substring filter value",
+                filter,
+                offset=offset,
+                length=length,
+            )
+
+    return first, values, end
 
 
 def _unpack_filter_value(
@@ -351,9 +566,33 @@ def _unpack_filter_value(
         raise FilterSyntaxError(
             str(e),
             filter=filter,
-            start=offset,
-            end=offset + length,
+            offset=offset,
+            length=length,
         )
+
+
+def _serialize_filter_value(
+    value: bytes,
+) -> str:
+    """Serializes a filter value.
+
+    Serializes the raw filter value bytes into a string that can be used inside
+    an LDAP filter string. It will escape any control char, (, ), *, \\ as well
+    as any non-ASCII chars (outside of \\x7F). While it is possible to embed
+    non-ASCII chars inside a filter string it safer and more portable to ensure
+    they are in the escaped form to remove any ambiguity.
+
+    Args:
+        value: The raw value to serialize.
+
+    Returns:
+        str: The serialized filter value.
+    """
+
+    def rplcr(matchobj: re.Match) -> bytes:
+        return f"\\{ord(matchobj.group(0)):02x}".encode("utf-8")
+
+    return _STRING_ESCAPE_PATTERN.sub(rplcr, value).decode("utf-8")
 
 
 @dataclasses.dataclass
@@ -495,15 +734,15 @@ class LDAPFilter:
         Returns:
             LDAPFilter: The converted filter.
         """
-        b_filter = filter.encode("utf-8")
+        b_filter = filter.encode("utf-8", errors="surrogateescape")
         filter_view = memoryview(b_filter)
         filter_obj, consumed = _unpack_filter(filter, filter_view, 0, len(b_filter))
         if consumed < len(b_filter):
             raise FilterSyntaxError(
                 "Extra data found at filter end",
                 filter=filter,
-                start=consumed,
-                end=len(b_filter),
+                offset=consumed,
+                length=len(b_filter) - consumed,
             )
 
         return filter_obj
@@ -552,6 +791,10 @@ class FilterAnd(LDAPFilter):
 
     filters: t.List[LDAPFilter]
 
+    def __str__(self) -> str:
+        filter_strings = "".join(str(f) for f in self.filters)
+        return f"(&{filter_strings})"
+
     def pack(
         self,
         writer: ASN1Writer,
@@ -597,6 +840,10 @@ class FilterOr(LDAPFilter):
     filter_id: int = dataclasses.field(init=False, repr=False, default=1)
 
     filters: t.List[LDAPFilter]
+
+    def __str__(self) -> str:
+        filter_strings = "".join(str(f) for f in self.filters)
+        return f"(|{filter_strings})"
 
     def pack(
         self,
@@ -644,6 +891,9 @@ class FilterNot(LDAPFilter):
 
     filter: LDAPFilter
 
+    def __str__(self) -> str:
+        return f"(!{self.filter!s})"
+
     def pack(
         self,
         writer: ASN1Writer,
@@ -686,6 +936,9 @@ class FilterEquality(LDAPFilter):
 
     attribute: str
     value: bytes
+
+    def __str__(self) -> str:
+        return f"({self.attribute}={_serialize_filter_value(self.value)})"
 
     def pack(
         self,
@@ -736,6 +989,18 @@ class FilterSubstrings(LDAPFilter):
     initial: t.Optional[bytes]
     any: t.List[bytes]
     final: t.Optional[bytes]
+
+    def __str__(self) -> str:
+        values = [
+            _serialize_filter_value(self.initial or b""),
+        ]
+        for a in self.any:
+            values.append(_serialize_filter_value(a))
+
+        values.append(_serialize_filter_value(self.final or b""))
+
+        value_str = "*".join(values)
+        return f"({self.attribute}={value_str})"
 
     def pack(
         self,
@@ -846,6 +1111,9 @@ class FilterGreaterOrEqual(LDAPFilter):
     attribute: str
     value: bytes
 
+    def __str__(self) -> str:
+        return f"({self.attribute}>={_serialize_filter_value(self.value)})"
+
     def pack(
         self,
         writer: ASN1Writer,
@@ -890,6 +1158,9 @@ class FilterLessOrEqual(LDAPFilter):
     attribute: str
     value: bytes
 
+    def __str__(self) -> str:
+        return f"({self.attribute}<={_serialize_filter_value(self.value)})"
+
     def pack(
         self,
         writer: ASN1Writer,
@@ -932,6 +1203,9 @@ class FilterPresent(LDAPFilter):
 
     attribute: str
 
+    def __str__(self) -> str:
+        return f"({self.attribute}=*)"
+
     def pack(
         self,
         writer: ASN1Writer,
@@ -973,6 +1247,9 @@ class FilterApproxMatch(LDAPFilter):
 
     attribute: str
     value: bytes
+
+    def __str__(self) -> str:
+        return f"({self.attribute}~={_serialize_filter_value(self.value)})"
 
     def pack(
         self,
@@ -1028,6 +1305,18 @@ class FilterExtensibleMatch(LDAPFilter):
     attribute: t.Optional[str]
     value: bytes
     dn_attributes: bool
+
+    def __str__(self) -> str:
+        headers = [self.attribute or ""]
+
+        if self.dn_attributes:
+            headers.append("dn")
+
+        if self.rule is not None:
+            headers.append(self.rule)
+
+        header_str = ":".join(headers)
+        return f"({header_str}:={_serialize_filter_value(self.value)})"
 
     def pack(
         self,
