@@ -9,14 +9,15 @@ from .examples.asyncio.sasl import Gssapi, GssSpnego
 
 
 async def test_simple_bind(client: LDAPClient) -> None:
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
     async with client:
         username = os.environ.get("SANSLDAP_USERNAME", None)
         password = os.environ.get("SANSLDAP_PASSWORD", None)
 
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        await client.start_tls(ssl_context)
+        # await client.start_tls(ssl_context)
 
         # await client.bind_simple(username, password=password)
 

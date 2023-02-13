@@ -19,6 +19,20 @@ async def create_ldap_client(
     port: t.Optional[int] = None,
     ssl_context: t.Optional[ssl.SSLContext] = None,
 ) -> LDAPClient:
+    """Creates the LDAP client.
+
+    Creates the LDAP client with an asyncio connection.
+
+    Args:
+        server: The server to connect to.
+        port: The port to connect with, defaults to 389 if no ssl_context is
+            set, else 636 (LDAPS).
+        ssl_context: The SSL context to use, when set LDAPS is used and the
+            default port changes to 636.
+
+    Returns:
+        LDAPClient: The LDAP client.
+    """
     port = port if port is not None else (389 if ssl_context is None else 636)
 
     reader, writer = await asyncio.open_connection(
@@ -97,6 +111,19 @@ class ResponseHandler(t.Generic[MessageType]):
 
 
 class LDAPClient:
+    """ThE Asyncio LDAP Client.
+
+    The LDAP client, this should not be initialized directly, use
+    :func:`create_ldap_client` instead. This is designed as an example of how
+    sansldap can be used. It is not fully tested but can be used for
+    inspiration.
+
+    Args:
+        server: The server that was used in the connection.
+        reader: The connection StreamReader.
+        writer: The connection StreamWriter.
+    """
+
     def __init__(
         self,
         server: str,
@@ -130,6 +157,15 @@ class LDAPClient:
         self,
         provider: SaslProvider,
     ) -> None:
+        """Bind using SASL.
+
+        Performs a SASL bind using the SASL provider specified. Common SASL
+        providers are :class:`External`, :class:`Gssapi`, and
+        :class:`GssSpnego`.
+
+        Args:
+            provider: The SASL provider to bind with.
+        """
         tls_channel: t.Optional[ssl.SSLObject] = None
         in_token: t.Optional[bytes] = None
 
@@ -159,12 +195,24 @@ class LDAPClient:
         username: t.Optional[str] = None,
         password: t.Optional[str] = None,
     ) -> None:
+        """Bind using Simple Auth.
+
+        Binds using Simple auth. The format for username depends on the LDAP
+        server implementation.
+
+        Args:
+            username: The username/CN to bind with. If not set then anonymous
+                auth will be used.
+            password: The password for the user. Using no password will result
+                in an unauthenticated bind.
+        """
         msg_id = self._protocol.bind_simple(username, password)
         response = await self._write_and_wait_one(msg_id, sansldap.BindResponse)
 
         self._valid_result(response.result, "simple bind failed")
 
     async def close(self) -> None:
+        """Closes the LDAP connection."""
         self._writer.close()
         await self._writer.wait_closed()
         await self._reader_task
@@ -225,6 +273,17 @@ class LDAPClient:
         server_hostname: t.Optional[str] = None,
         ssl_handshake_timeout: t.Optional[int] = None,
     ) -> None:
+        """LDAP StartTLS.
+
+        Performs the LDAP StartTLS extended request. This upgrades the
+        connection to one protected by TLS.
+
+        Args:
+            options: The SSLContext used to perform the TLS handshake.
+            server_hostname: The hostname used to check the server name in the
+                TLS handshake.
+            ssl_handshake_timeout: The timeout for the handshake.
+        """
         # start_tls was added in Python 3.11
         if not hasattr(self._writer, "start_tls"):
             raise Exception("Need Python 3.11 for StartTLS")
@@ -235,11 +294,19 @@ class LDAPClient:
 
         await self._writer.start_tls(
             options,
-            server_hostname=server_hostname,
+            server_hostname=server_hostname or self.server,
             ssl_handshake_timeout=ssl_handshake_timeout,
         )
 
     async def whoami(self) -> str:
+        """LDAP Whoami.
+
+        Performs an LDAP Whoami extended request to get the authenticated user
+        name for the bound connection.
+
+        Returns:
+            str: The authenticated user returned by the server.
+        """
         msg_id = self._protocol.extended_request("1.3.6.1.4.1.4203.1.11.3")
         response = await self._write_and_wait_one(msg_id, sansldap.ExtendedResponse)
         self._valid_result(response.result, "whoami request failed")
@@ -257,10 +324,10 @@ class LDAPClient:
                 data_buffer.extend(resp)
 
                 while data_buffer:
-                    if self._sasl_provider and False:
+                    if self._sasl_provider:
                         dec_data, enc_len = self._sasl_provider.unwrap(data_buffer)
                         if enc_len == 0:
-                            continue
+                            break
 
                         data_buffer = data_buffer[enc_len:]
                     else:
