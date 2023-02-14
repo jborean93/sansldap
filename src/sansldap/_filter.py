@@ -333,7 +333,7 @@ def _unpack_simple_filter(
             length=length,
         )
 
-    filter_type = chr(current_view[equals_idx - 1])
+    filter_type: t.Optional[str] = chr(current_view[equals_idx - 1])
     attribute_end = equals_idx
     if filter_type in [":", ">", "<", "~"]:
         if equals_idx == 1:
@@ -345,7 +345,7 @@ def _unpack_simple_filter(
             )
         attribute_end -= 1
     else:
-        filter_type == 0
+        filter_type = None
 
     attribute = current_view[:attribute_end].tobytes().decode("utf-8")
     if filter_type != ":" and not _ATTRIBUTE_PATTERN.match(attribute):
@@ -367,7 +367,7 @@ def _unpack_simple_filter(
 
     raw_value = current_view[read : read + value_length].tobytes()
     read += value_length
-    if filter_type != 0 or b"*" not in raw_value:
+    if filter_type or b"*" not in raw_value:
         b_value = _unpack_filter_value(
             filter,
             raw_value,
@@ -654,29 +654,37 @@ class LDAPFilter:
 
             @dataclasses.dataclass
             class CustomFilter(LDAPFilter):
-                filter_id = dataclasses.field(init=False, repr=False, default=1024)
+                filter_id: int = dataclasses.field(init=False, repr=False, default=1024)
 
                 value: str
 
                 def pack(
                     self,
-                    writer: ASN1Writer,
+                    writer: sansldap.asn1.ASN1Writer,
                     options: FilterOptions,
                 ) -> None:
                     writer.write_octet_string(
                         self.value.encode(options.string_encoding),
-                        tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, False),
+                        tag=sansldap.asn1.ASN1Tag(
+                            sansldap.asn1.TagClass.CONTEXT_SPECIFIC,
+                            self.filter_id,
+                            False,
+                        ),
                     )
 
                 @classmethod
                 def unpack(
                     cls,
-                    reader: ASN1Reader,
+                    reader: sansldap.asn1.ASN1Reader,
                     options: FilterOptions,
                 ) -> CustomFilter:
                     value = reader.read_octet_string(
-                        ASN1Tag(TagClass.CONTEXT_SPECIFIC, cls.filter_id, False),
-                    )
+                        sansldap.asn1.ASN1Tag(
+                            sansldap.asn1.TagClass.CONTEXT_SPECIFIC,
+                            cls.filter_id,
+                            False,
+                        ),
+                    ).decode("utf-8")
                     return CustomFilter(value=value)
 
     Note:
@@ -715,7 +723,7 @@ class LDAPFilter:
             options: Options that can be used to control how the filter is
                 packed.
         """
-        raise NotImplementedError()
+        raise NotImplementedError()  # pragma: nocover
 
     @classmethod
     def from_string(
@@ -734,6 +742,7 @@ class LDAPFilter:
         Returns:
             LDAPFilter: The converted filter.
         """
+        filter = filter.strip()
         b_filter = filter.encode("utf-8", errors="surrogateescape")
         filter_view = memoryview(b_filter)
         filter_obj, consumed = _unpack_filter(filter, filter_view, 0, len(b_filter))
@@ -1012,7 +1021,7 @@ class FilterSubstrings(LDAPFilter):
         ) as w:
             w.write_octet_string(self.attribute.encode(options.string_encoding))
 
-            with writer.push_sequence_of() as value_writer:
+            with w.push_sequence_of() as value_writer:
                 if self.initial is not None:
                     value_writer.write_octet_string(
                         self.initial,

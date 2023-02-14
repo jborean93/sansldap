@@ -1,11 +1,16 @@
 # Copyright: (c) 2023, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+import base64
+import re
+
+import pytest
+
 import sansldap._authentication as a
 import sansldap._controls as c
 import sansldap._filter as f
 import sansldap._messages as m
-from sansldap.asn1 import ASN1Reader
+from sansldap.asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass, TypeTagNumber
 
 from .conftest import get_test_data
 
@@ -15,6 +20,64 @@ PACKING_OPTIONS = m.PackingOptions()
 def unpack_message(data: bytes) -> m.LDAPMessage:
     reader = ASN1Reader(data)
     return m.unpack_ldap_message(reader, PACKING_OPTIONS)
+
+
+class TestGenericMessages:
+    def test_fail_unpack_not_application_tag(self) -> None:
+        writer = ASN1Writer()
+        with writer.push_sequence() as writer_seq:
+            writer_seq.write_integer(0)
+            writer_seq.write_octet_string(b"value")
+        data = writer.get_data()
+
+        expected = "Expecting LDAPMessage.protocolOp to be an APPLICATION but got ASN1Tag(tag_class=<TagClass.UNIVERSAL: 0>, tag_number=<TypeTagNumber.OCTET_STRING: 4>, is_constructed=False)"
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            unpack_message(data)
+
+    def test_fail_unpack_unknown_protocol_op(self) -> None:
+        writer = ASN1Writer()
+        with writer.push_sequence() as writer_seq:
+            writer_seq.write_integer(0)
+            writer_seq.write_octet_string(b"value", tag=ASN1Tag(TagClass.APPLICATION, 1024, False))
+        data = writer.get_data()
+
+        expected = "Unknown LDAPMessage.protocolOp choice 1024"
+        with pytest.raises(NotImplementedError, match=re.escape(expected)):
+            unpack_message(data)
+
+    def test_unpack_extra_data_in_header(self) -> None:
+        # UnbindRequest with a random OCTET_STRING between the protocolOp and
+        # controls
+        data = base64.b64decode(b"MCkCAQBiAAQFZHVtbXmgGzAZBBcxLjIuODQwLjExMzU1Ni4xLjQuMjA2NQ==")
+
+        actual = unpack_message(data)
+        assert isinstance(actual, m.UnbindRequest)
+        assert len(actual.controls) == 1
+        assert isinstance(actual.controls[0], c.ShowDeactivatedLinkControl)
+        assert actual.controls[0].critical is False
+
+    def test_unpack_extra_context_specific_data_in_header(self) -> None:
+        # UnbindRequest with a random CONTEXT_SPECIFIC tagged OCTET_STRING
+        # between the protocolOp and controls
+        data = base64.b64decode(b"MCsCAQBiAJ+IAAVkdW1teaAbMBkEFzEuMi44NDAuMTEzNTU2LjEuNC4yMDY1")
+
+        actual = unpack_message(data)
+        assert isinstance(actual, m.UnbindRequest)
+        assert len(actual.controls) == 1
+        assert isinstance(actual.controls[0], c.ShowDeactivatedLinkControl)
+        assert actual.controls[0].critical is False
+
+
+class TestLDAPResultCode:
+    def test_add_missing_member(self) -> None:
+        value = m.LDAPResultCode(666)
+        assert isinstance(value, m.LDAPResultCode)
+        assert value.name == "UNKNOWN 0x0000029A"
+        assert value.value == 666
+
+    def test_fail_adding_non_integer(self) -> None:
+        with pytest.raises(ValueError, match="'abc' is not a valid LDAPResultCode"):
+            m.LDAPResultCode("abc")  # type: ignore[arg-type]  # Testing this
 
 
 class TestBindRequest:
@@ -147,6 +210,19 @@ class TestBindResponse:
         assert actual.result.referrals is None
         assert isinstance(actual.server_sasl_creds, bytes)
         assert len(actual.server_sasl_creds) == 186
+
+    def test_parse_with_extra_data(self) -> None:
+        data = base64.b64decode("MBgCAQFhEwoBAAQABAAEBWR1bW15hwNhYmM=")
+
+        actual = unpack_message(data)
+        assert isinstance(actual, m.BindResponse)
+        assert actual.message_id == 1
+        assert actual.controls == []
+        assert actual.result.result_code == m.LDAPResultCode.SUCCESS
+        assert actual.result.diagnostics_message == ""
+        assert actual.result.matched_dn == ""
+        assert actual.result.referrals is None
+        assert actual.server_sasl_creds == b"abc"
 
 
 class TestSearchRequest:
@@ -389,6 +465,23 @@ class TestSearchResultDone:
         assert actual.result.referrals == ["ldap://foo.ldap.test/DC=foo,DC=ldap,DC=test"]
 
 
+class TestSearchResultReference:
+    def test_create(self) -> None:
+        msg = m.SearchResultReference(
+            message_id=2,
+            controls=[],
+            uris=["uri 1", "uri 2"],
+        )
+        actual = msg.pack(PACKING_OPTIONS)
+        assert isinstance(actual, bytes)
+
+        unpacked = unpack_message(actual)
+        assert isinstance(unpacked, m.SearchResultReference)
+        assert unpacked.message_id == 2
+        assert unpacked.controls == []
+        assert unpacked.uris == ["uri 1", "uri 2"]
+
+
 class TestExtendedRequest:
     def test_create(self) -> None:
         msg = m.ExtendedRequest(
@@ -432,6 +525,15 @@ class TestExtendedRequest:
         assert actual.message_id == 1
         assert actual.name == "1.3.6.1.4.1.1466.20037"
         assert actual.value is None
+
+    def test_parse_with_extra_data(self) -> None:
+        data = base64.b64decode("MCsCAQF3JoAWMS4zLjYuMS40LjEuMTQ2Ni4yMDAzNwQFZHVtbXmBBXZhbHVl")
+
+        actual = unpack_message(data)
+        assert isinstance(actual, m.ExtendedRequest)
+        assert actual.message_id == 1
+        assert actual.name == "1.3.6.1.4.1.1466.20037"
+        assert actual.value == b"value"
 
 
 class TestExtendedResponse:
@@ -501,3 +603,47 @@ class TestExtendedResponse:
         assert actual.result.referrals is None
         assert actual.name == "1.3.6.1.4.1.1466.20037"
         assert actual.value is None
+
+    def test_parse_ms_ad_notice_of_disconnect(self) -> None:
+        data = get_test_data("notice_of_disconnect_ad")
+        actual = unpack_message(data)
+
+        assert isinstance(actual, m.ExtendedResponse)
+        assert actual.message_id == 0
+        assert actual.result.result_code == m.LDAPResultCode.PROTOCOL_ERROR
+        assert (
+            actual.result.diagnostics_message
+            == "00000057: LdapErr: DSID-00000000, comment: Error decoding ldap message, data 0, v4563\x00"
+        )
+        assert actual.result.matched_dn == ""
+        assert actual.result.referrals is None
+        assert actual.name == "1.3.6.1.4.1.1466.20036"
+        assert actual.value is None
+
+    def test_parse_with_extra_data(self) -> None:
+        data = base64.b64decode("MC4CAQF4KQoBAAQABACKEzEuMi4zLjEyOTMuNDkyMTkwLjEEBWR1bW15iwRhYmMA")
+
+        actual = unpack_message(data)
+        assert isinstance(actual, m.ExtendedResponse)
+        assert actual.message_id == 1
+        assert actual.controls == []
+        assert actual.result.result_code == m.LDAPResultCode.SUCCESS
+        assert actual.result.matched_dn == ""
+        assert actual.result.diagnostics_message == ""
+        assert actual.result.referrals is None
+        assert actual.name == "1.2.3.1293.492190.1"
+        assert actual.value == b"abc\x00"
+
+    def test_parse_with_extra_context_specific_data(self) -> None:
+        data = base64.b64decode("MDACAQF4KwoBAAQABACKEzEuMi4zLjEyOTMuNDkyMTkwLjGfiAAFZHVtbXmLBGFiYwA=")
+
+        actual = unpack_message(data)
+        assert isinstance(actual, m.ExtendedResponse)
+        assert actual.message_id == 1
+        assert actual.controls == []
+        assert actual.result.result_code == m.LDAPResultCode.SUCCESS
+        assert actual.result.matched_dn == ""
+        assert actual.result.diagnostics_message == ""
+        assert actual.result.referrals is None
+        assert actual.name == "1.2.3.1293.492190.1"
+        assert actual.value == b"abc\x00"

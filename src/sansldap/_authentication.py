@@ -48,26 +48,43 @@ class AuthenticationCredential:
         .. code-block:: python
 
             @dataclasses.dataclass
-            class CustomAuthentication(AuthenticationCredential):
-                auth_id = dataclasses.field(init=False, repr=false, default=1024)
+            class CustomAuth(a.AuthenticationCredential):
+                auth_id: int = dataclasses.field(init=False, repr=False, default=1024)
 
                 username: str
                 password: str
 
                 def pack(
                     self,
-                    options: SerializationOptions,
-                ) -> bytes:
-                    return f"{self.username}:{self.password}".encode(options.string_encoding)
+                    writer: sansldap.asn1.ASN1Writer,
+                    options: a.AuthenticationOptions,
+                ) -> None:
+                    writer.write_octet_string(
+                        f"{self.username}:{self.password}".encode(options.string_encoding),
+                        tag=sansldap.asn1.ASN1Tag(
+                            sansldap.asn1.TagClass.CONTEXT_SPECIFIC,
+                            self.auth_id,
+                            False,
+                        ),
+                    )
 
                 @classmethod
                 def unpack(
                     cls,
-                    data: bytes,
-                    options: SerializationOptions,
-                ) -> CustomAuthentication:
-                    username, password = data.decode(options.string_encoding).split(":")
-                    return CustomAuthentication(username=username, password=password)
+                    reader: sansldap.asn1.ASN1Reader,
+                    options: a.AuthenticationOptions,
+                ) -> CustomAuth:
+                    value = reader.read_octet_string(
+                        tag=sansldap.asn1.ASN1Tag(
+                            sansldap.asn1.TagClass.CONTEXT_SPECIFIC,
+                            cls.auth_id,
+                            False,
+                        ),
+                        hint="CustomAuth.value",
+                    ).decode(options.string_encoding)
+                    username, _, password = value.partition(":")
+
+                    return CustomAuth(username=username, password=password)
 
     Args:
         auth_id: The ASN.1 choice value for this credential.
@@ -99,7 +116,7 @@ class AuthenticationCredential:
             options: Options that can be used to control how the authentication
                 credential is packed.
         """
-        raise NotImplementedError()
+        raise NotImplementedError()  # pragma: nocover
 
     @classmethod
     def unpack(

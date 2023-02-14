@@ -8,7 +8,8 @@ import pathlib
 
 import pytest
 
-from .examples.asyncio.client import LDAPClient, create_ldap_client
+from .examples.asyncio import AsyncLDAPClient, create_async_ldap_client
+from .examples.sync import SyncLDAPClient, create_sync_ldap_client
 
 
 def get_test_data(name: str) -> bytes:
@@ -17,13 +18,28 @@ def get_test_data(name: str) -> bytes:
 
 
 @pytest.fixture
-async def client() -> LDAPClient:
+async def async_client() -> AsyncLDAPClient:
     server = os.environ.get("SANSLDAP_SERVER", None)
     if not server:
         return pytest.skip("SANSLDAP_SERVER env var must be set for client integration tests")
 
     port = os.environ.get("SANSLDAP_PORT", None)
-    ldap_client = await create_ldap_client(
+    ldap_client = await create_async_ldap_client(
+        server=server,
+        port=int(port) if port else None,
+    )
+
+    return ldap_client
+
+
+@pytest.fixture
+def sync_client() -> SyncLDAPClient:
+    server = os.environ.get("SANSLDAP_SERVER", None)
+    if not server:
+        return pytest.skip("SANSLDAP_SERVER env var must be set for client integration tests")
+
+    port = os.environ.get("SANSLDAP_PORT", None)
+    ldap_client = create_sync_ldap_client(
         server=server,
         port=int(port) if port else None,
     )

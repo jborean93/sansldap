@@ -1,14 +1,24 @@
 # Copyright: (c) 2023, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+from __future__ import annotations
+
 import base64
+import dataclasses
 import re
 import typing as t
 
 import pytest
 
 import sansldap._filter as f
-from sansldap.asn1 import ASN1Reader
+import sansldap._messages as m
+from sansldap.asn1 import ASN1Reader, ASN1Tag, ASN1Writer, TagClass
+
+
+def pack_filter(filter: f.LDAPFilter) -> bytes:
+    writer = ASN1Writer()
+    filter.pack(writer, f.FilterOptions())
+    return writer.get_data()
 
 
 def unpack_filter(data: bytes) -> f.LDAPFilter:
@@ -71,6 +81,17 @@ class TestFilterFromStringGeneric:
         assert exc.value.filter == ldap_filter
         assert exc.value.offset == 0
         assert exc.value.length == 2
+
+    def test_fail_complex_no_value(self) -> None:
+        ldap_filter = "(&"
+        expected = "No filter value found after conditional"
+
+        with pytest.raises(f.FilterSyntaxError, match=re.escape(expected)) as exc:
+            f.LDAPFilter.from_string(ldap_filter)
+
+        assert exc.value.filter == ldap_filter
+        assert exc.value.offset == 1
+        assert exc.value.length == 1
 
     @pytest.mark.parametrize(
         "attribute",
@@ -205,6 +226,19 @@ class TestFilterFromStringGeneric:
         assert exc.value.offset == 4
         assert exc.value.length == len(value)
 
+    def test_parse_with_whitespace(self) -> None:
+        actual = f.LDAPFilter.from_string("   (   foo=bar )   ")
+        assert isinstance(actual, f.FilterEquality)
+        assert actual.attribute == "foo"
+        assert actual.value == b"bar "
+
+    def test_parse_complex_with_whitespace(self) -> None:
+        actual = f.LDAPFilter.from_string("   (! (  foo=bar ) )  ")
+        assert isinstance(actual, f.FilterNot)
+        assert isinstance(actual.filter, f.FilterEquality)
+        assert actual.filter.attribute == "foo"
+        assert actual.filter.value == b"bar "
+
 
 class TestFilterAnd:
     def test_simple(self) -> None:
@@ -255,6 +289,32 @@ class TestFilterAnd:
         assert isinstance(actual.filters[1].filters[2].filters[0], f.FilterGreaterOrEqual)
         assert actual.filters[1].filters[2].filters[0].attribute == "test"
         assert actual.filters[1].filters[2].filters[0].value == b"1"
+
+    @pytest.mark.parametrize(
+        "ldap_filter, expected",
+        [
+            (
+                "(&(foo=bar)(attr=*))",
+                "oBKjCgQDZm9vBANiYXKHBGF0dHI=",
+            ),
+            (
+                "(&(foo=bar)(&(attr=abc*test*end)(attr:rule:=test)(&(test>=1))))",
+                "oEmjCgQDZm9vBANiYXKgO6QYBARhdHRyMBCAA2FiY4EEdGVzdIIDZW5kqRKBBHJ1bGWCBGF0dHKDBHRlc3SgC6UJBAR0ZXN0BAEx",
+            ),
+        ],
+        ids=["simple", "complex"],
+    )
+    def test_roundtrip(self, ldap_filter: str, expected: str) -> None:
+        expected_data = base64.b64decode(expected)
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
 
     def test_fail_from_string_no_new_group(self) -> None:
         ldap_filter = "(&(objectClass=*)foo=bar)"
@@ -370,6 +430,32 @@ class TestFilterOr:
         assert isinstance(actual.filters[1].filters[2].filters[0], f.FilterLessOrEqual)
         assert actual.filters[1].filters[2].filters[0].attribute == "test"
 
+    @pytest.mark.parametrize(
+        "ldap_filter, expected",
+        [
+            (
+                "(|(foo=bar)(attr=*))",
+                "oRKjCgQDZm9vBANiYXKHBGF0dHI=",
+            ),
+            (
+                "(|(foo=bar)(|(attr=*)(attr:dn:rule:=test)(&(test<=1))))",
+                "oTijCgQDZm9vBANiYXKhKocEYXR0cqkVgQRydWxlggRhdHRygwR0ZXN0hAH/oAumCQQEdGVzdAQBMQ==",
+            ),
+        ],
+        ids=["simple", "complex"],
+    )
+    def test_roundtrip(self, ldap_filter: str, expected: str) -> None:
+        expected_data = base64.b64decode(expected)
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
+
     def test_fail_from_string_no_new_group(self) -> None:
         ldap_filter = "(|(objectClass=*)foo=bar)"
         expected = "Expecting ')' to end complex filter expression"
@@ -458,6 +544,32 @@ class TestFilterNot:
         assert actual.filter.filter.attribute == "foo"
         assert actual.filter.filter.value == b"bar"
 
+    @pytest.mark.parametrize(
+        "ldap_filter, expected",
+        [
+            (
+                "(!(foo=bar))",
+                "ogyjCgQDZm9vBANiYXI=",
+            ),
+            (
+                "(!(!(foo=bar)))",
+                "og6iDKMKBANmb28EA2Jhcg==",
+            ),
+        ],
+        ids=["simple", "complex"],
+    )
+    def test_roundtrip(self, ldap_filter: str, expected: str) -> None:
+        expected_data = base64.b64decode(expected)
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
+
     def test_fail_multiple_values(self) -> None:
         ldap_filter = "(!(objectClass=*)(foo=bar))"
         expected = "Multiple filters found for not '!' expression"
@@ -535,6 +647,19 @@ class TestFilterEquality:
 
         assert isinstance(filter, f.FilterEquality)
         assert str(filter) == expected
+
+    def test_roundtrip(self) -> None:
+        ldap_filter = r"(objectClass;test=abc def \e2\98\ba caf\c3\a9)"
+        expected_data = base64.b64decode("oyUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
 
     def test_unpack(self) -> None:
         data = base64.b64decode("oyUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
@@ -687,6 +812,45 @@ class TestFilterSubstrings:
         assert str(filter) == expected
 
     @pytest.mark.parametrize(
+        "ldap_filter, expected",
+        [
+            (
+                r"(objectClass;test=*abc *def \e2\98\ba *caf\c3\a9*)",
+                "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4EEYWJjIIEIZGVmIOKYuiCBBWNhZsOp",
+            ),
+            (
+                r"(objectClass;test=abc *def \e2\98\ba *caf\c3\a9*)",
+                "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4AEYWJjIIEIZGVmIOKYuiCBBWNhZsOp",
+            ),
+            (
+                r"(objectClass;test=*abc *def \e2\98\ba *caf\c3\a9)",
+                "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4EEYWJjIIEIZGVmIOKYuiCCBWNhZsOp",
+            ),
+            (
+                r"(objectClass;test=abc *def \e2\98\ba *caf\c3\a9)",
+                "pCsEEG9iamVjdENsYXNzO3Rlc3QwF4AEYWJjIIEIZGVmIOKYuiCCBWNhZsOp",
+            ),
+        ],
+        ids=[
+            "no_initial_and_no_final",
+            "initial_and_no_final",
+            "no_initial_and_final",
+            "initial_and_final",
+        ],
+    )
+    def test_roundtrip(self, ldap_filter: str, expected: str) -> None:
+        expected_data = base64.b64decode(expected)
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
+
+    @pytest.mark.parametrize(
         "attribute, initial, any_values, final, data",
         [
             (
@@ -742,6 +906,30 @@ class TestFilterSubstrings:
         assert actual.any == [a.encode("utf-8") for a in any_values]
         assert actual.final == (final.encode("utf-8") if final else None)
 
+    def test_unpack_ignore_untagged_values(self) -> None:
+        data = base64.b64decode("pBQEBGF0dHIwDJ+IAANhYmOBA2FiYw==")
+
+        actual = unpack_filter(data)
+        assert isinstance(actual, f.FilterSubstrings)
+        assert actual.attribute == "attr"
+        assert actual.initial is None
+        assert actual.any == [b"abc"]
+        assert actual.final is None
+
+    def test_fail_unpack_multiple_initial(self) -> None:
+        expected = "Received multiple initial values when unpacking Filter.substrings"
+        data = base64.b64decode("pBIEBGF0dHIwCoADYWJjgANhYmM=")
+
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            unpack_filter(data)
+
+    def test_fail_unpack_multiple_final(self) -> None:
+        expected = "Received multiple final values when unpacking Filter.substrings"
+        data = base64.b64decode("pBIEBGF0dHIwCoIDYWJjggNhYmM=")
+
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            unpack_filter(data)
+
 
 class TestFilterGreaterOrEqual:
     @pytest.mark.parametrize(
@@ -776,6 +964,19 @@ class TestFilterGreaterOrEqual:
 
         assert isinstance(filter, f.FilterGreaterOrEqual)
         assert str(filter) == expected
+
+    def test_roundtrip(self) -> None:
+        ldap_filter = r"(objectClass;test>=abc def \e2\98\ba caf\c3\a9)"
+        expected_data = base64.b64decode("pSUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
 
     def test_unpack(self) -> None:
         data = base64.b64decode("pSUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
@@ -820,6 +1021,19 @@ class TestFilterLessOrEqual:
         assert isinstance(filter, f.FilterLessOrEqual)
         assert str(filter) == expected
 
+    def test_roundtrip(self) -> None:
+        ldap_filter = r"(objectClass;test<=abc def \e2\98\ba caf\c3\a9)"
+        expected_data = base64.b64decode("piUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
+
     def test_unpack(self) -> None:
         data = base64.b64decode("piUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
         actual = unpack_filter(data)
@@ -863,6 +1077,19 @@ class TestFilterPresent:
         assert actual.attribute == attribute
         assert str(actual) == f"({actual.attribute}=*)"
 
+    def test_roundtrip(self) -> None:
+        ldap_filter = "(1.2.3.341.0.1;test=*)"
+        expected_data = base64.b64decode("hxIxLjIuMy4zNDEuMC4xO3Rlc3Q=")
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
+
     def test_unpack(self) -> None:
         data = base64.b64decode("hxIxLjIuMy4zNDEuMC4xO3Rlc3Q=")
         actual = unpack_filter(data)
@@ -904,6 +1131,19 @@ class TestFilterApproxMatch:
 
         assert isinstance(filter, f.FilterApproxMatch)
         assert str(filter) == expected
+
+    def test_roundtrip(self) -> None:
+        ldap_filter = r"(objectClass;test~=abc def \e2\98\ba caf\c3\a9)"
+        expected_data = base64.b64decode("qCUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
 
     def test_unpack(self) -> None:
         data = base64.b64decode("qCUEEG9iamVjdENsYXNzO3Rlc3QEEWFiYyBkZWYg4pi6IGNhZsOp")
@@ -1048,6 +1288,55 @@ class TestFilterExtensibleMatch:
         assert exc.value.length == length
 
     @pytest.mark.parametrize(
+        "ldap_filter, expected",
+        [
+            (
+                r"(objectClass:=def \e2\98\ba)",
+                "qRaCC29iamVjdENsYXNzgwdkZWYg4pi6",
+            ),
+            (
+                r"(objectClass:dn:=def \e2\98\ba)",
+                "qRmCC29iamVjdENsYXNzgwdkZWYg4pi6hAH/",
+            ),
+            (
+                r"(:rule:=def \e2\98\ba)",
+                "qQ+BBHJ1bGWDB2RlZiDimLo=",
+            ),
+            (
+                r"(:dn:rule:=def \e2\98\ba)",
+                "qRKBBHJ1bGWDB2RlZiDimLqEAf8=",
+            ),
+            (
+                r"(objectClass:rule:=def \e2\98\ba)",
+                "qRyBBHJ1bGWCC29iamVjdENsYXNzgwdkZWYg4pi6",
+            ),
+            (
+                r"(objectClass:dn:rule:=def \e2\98\ba)",
+                "qR+BBHJ1bGWCC29iamVjdENsYXNzgwdkZWYg4pi6hAH/",
+            ),
+        ],
+        ids=[
+            "only_attribute",
+            "only_attribute_dn",
+            "only_rule",
+            "only_rule_dn",
+            "attribute_and_rule",
+            "attribute_and_rule_dn",
+        ],
+    )
+    def test_roundtrip(self, ldap_filter: str, expected: str) -> None:
+        expected_data = base64.b64decode(expected)
+
+        actual_filter = f.LDAPFilter.from_string(ldap_filter)
+        assert str(actual_filter) == ldap_filter
+
+        actual_data = pack_filter(actual_filter)
+        assert actual_data == expected_data
+
+        unpacked_filter = unpack_filter(actual_data)
+        assert str(unpacked_filter) == ldap_filter
+
+    @pytest.mark.parametrize(
         "attribute, dn_attributes, rule, value, data, expected_str",
         [
             (
@@ -1126,3 +1415,144 @@ class TestFilterExtensibleMatch:
         assert actual.rule == rule
         assert actual.value == value
         assert str(actual) == expected_str
+
+    def test_unpack_ignore_untagged_values(self) -> None:
+        data = base64.b64decode("qRqfiAADZm9vgQRydWxlggRhdHRygwV2YWx1ZQ==")
+
+        actual = unpack_filter(data)
+        assert isinstance(actual, f.FilterExtensibleMatch)
+        assert actual.rule == "rule"
+        assert actual.attribute == "attr"
+        assert actual.dn_attributes is False
+        assert actual.value == b"value"
+
+    def test_unpack_ignore_untagged_values_not_context_specific(self) -> None:
+        data = base64.b64decode("qRgEA2Zvb4EEcnVsZYIEYXR0coMFdmFsdWU=")
+
+        actual = unpack_filter(data)
+        assert isinstance(actual, f.FilterExtensibleMatch)
+        assert actual.rule == "rule"
+        assert actual.attribute == "attr"
+        assert actual.dn_attributes is False
+        assert actual.value == b"value"
+
+
+@dataclasses.dataclass
+class CustomFilter(f.LDAPFilter):
+    filter_id: int = dataclasses.field(init=False, repr=False, default=1024)
+
+    value: str
+
+    def pack(
+        self,
+        writer: ASN1Writer,
+        options: f.FilterOptions,
+    ) -> None:
+        writer.write_octet_string(
+            self.value.encode(options.string_encoding),
+            tag=ASN1Tag(TagClass.CONTEXT_SPECIFIC, self.filter_id, False),
+        )
+
+    @classmethod
+    def unpack(
+        cls,
+        reader: ASN1Reader,
+        options: f.FilterOptions,
+    ) -> CustomFilter:
+        value = reader.read_octet_string(
+            ASN1Tag(TagClass.CONTEXT_SPECIFIC, cls.filter_id, False),
+        ).decode(options.string_encoding)
+        return CustomFilter(value=value)
+
+
+class TestFilterCustom:
+    def test_pack(self) -> None:
+        expected = base64.b64decode("MB8CAQBjGgQACgEACgEAAgEAAgEAAQEAn4gAA2ZvbzAA")
+        req = m.SearchRequest(
+            message_id=0,
+            controls=[],
+            base_object="",
+            scope=m.SearchScope.BASE,
+            deref_aliases=m.DereferencingPolicy.NEVER,
+            size_limit=0,
+            time_limit=0,
+            types_only=False,
+            filter=CustomFilter(value="foo"),
+            attributes=[],
+        )
+        actual = req.pack(m.PackingOptions())
+        assert actual == expected
+
+    def test_pack_custom_encoding(self) -> None:
+        expected = base64.b64decode("MCICAQBjHQQACgEACgEAAgEAAgEAAQEAn4gABmYAbwBvADAA")
+        req = m.SearchRequest(
+            message_id=0,
+            controls=[],
+            base_object="",
+            scope=m.SearchScope.BASE,
+            deref_aliases=m.DereferencingPolicy.NEVER,
+            size_limit=0,
+            time_limit=0,
+            types_only=False,
+            filter=CustomFilter(value="foo"),
+            attributes=[],
+        )
+        actual = req.pack(
+            m.PackingOptions(
+                filter=f.FilterOptions(
+                    string_encoding="utf-16-le",
+                )
+            )
+        )
+        assert actual == expected
+
+    def test_unpack(self) -> None:
+        data = base64.b64decode("MB8CAQBjGgQACgEACgEAAgEAAgEAAQEAn4gAA2ZvbzAA")
+        reader = ASN1Reader(data)
+
+        actual = m.unpack_ldap_message(
+            reader,
+            m.PackingOptions(
+                filter=f.FilterOptions(
+                    choices=[CustomFilter],
+                )
+            ),
+        )
+        assert isinstance(actual, m.SearchRequest)
+        assert isinstance(actual.filter, CustomFilter)
+        assert actual.filter.value == "foo"
+
+    def test_unpack_custom_encoding(self) -> None:
+        data = base64.b64decode("MCICAQBjHQQACgEACgEAAgEAAgEAAQEAn4gABmYAbwBvADAA")
+        reader = ASN1Reader(data)
+
+        actual = m.unpack_ldap_message(
+            reader,
+            m.PackingOptions(
+                filter=f.FilterOptions(
+                    string_encoding="utf-16-le",
+                    choices=[CustomFilter],
+                )
+            ),
+        )
+        assert isinstance(actual, m.SearchRequest)
+        assert isinstance(actual.filter, CustomFilter)
+        assert actual.filter.value == "foo"
+
+    def test_fail_unpack_not_registered(self) -> None:
+        expected = "Unknown filter object ASN1Tag(tag_class=<TagClass.CONTEXT_SPECIFIC: 2>, tag_number=1024, is_constructed=False), cannot unpack"
+
+        data = base64.b64decode("MB8CAQBjGgQACgEACgEAAgEAAgEAAQEAn4gAA2ZvbzAA")
+        reader = ASN1Reader(data)
+
+        with pytest.raises(NotImplementedError, match=re.escape(expected)):
+            m.unpack_ldap_message(reader, m.PackingOptions())
+
+    def test_fail_unpack_filter_not_context_specific(self) -> None:
+        expected = "Unknown filter object ASN1Tag(tag_class=<TagClass.UNIVERSAL: 0>, tag_number=<TypeTagNumber.OCTET_STRING: 4>, is_constructed=False), cannot unpack"
+
+        data = base64.b64decode("MB0CAQBjGAQACgEACgEAAgEAAgEAAQEABANmb28wAA==")
+        reader = ASN1Reader(data)
+
+        with pytest.raises(NotImplementedError, match=re.escape(expected)):
+            m.unpack_ldap_message(reader, m.PackingOptions())

@@ -4,16 +4,57 @@
 import os
 import ssl
 
-from .examples.asyncio.client import LDAPClient
-from .examples.asyncio.sasl import Gssapi, GssSpnego
+import sansldap
+
+from .examples.asyncio import AsyncLDAPClient
+from .examples.sasl import Gssapi, GssSpnego
+from .examples.sync import SyncLDAPClient
 
 
-async def test_simple_bind(client: LDAPClient) -> None:
+def test_sync_simple_bind(sync_client: SyncLDAPClient) -> None:
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
 
-    async with client:
+    with sync_client:
+        username = os.environ.get("SANSLDAP_USERNAME", None)
+        password = os.environ.get("SANSLDAP_PASSWORD", None)
+
+        # sync_client.start_tls(ssl_context)
+
+        # await client.bind_simple(username, password=password)
+
+        sync_client.bind_sasl(
+            Gssapi(
+                username=username,
+                password=password,
+                hostname=sync_client.server,
+                encrypt=False,
+                sign=False,
+            ),
+        )
+
+        a = sync_client.whoami()
+        b = ""
+
+        for res in sync_client.search_request(
+            "DC=domain,DC=test",
+            filter=sansldap.FilterEquality("objectClass", b"user"),
+            scope=sansldap.SearchScope.SUBTREE,
+            attributes=[
+                "sAMAccountName",
+                "userPrincipalName",
+            ],
+        ):
+            a = ""
+
+
+async def test_async_simple_bind(async_client: AsyncLDAPClient) -> None:
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    async with async_client:
         username = os.environ.get("SANSLDAP_USERNAME", None)
         password = os.environ.get("SANSLDAP_PASSWORD", None)
 
@@ -21,20 +62,20 @@ async def test_simple_bind(client: LDAPClient) -> None:
 
         # await client.bind_simple(username, password=password)
 
-        await client.bind_sasl(
+        await async_client.bind_sasl(
             Gssapi(
                 username=username,
                 password=password,
-                hostname=client.server,
+                hostname=async_client.server,
                 encrypt=True,
                 sign=True,
             ),
         )
 
-        a = await client.whoami()
+        a = await async_client.whoami()
         b = ""
 
-        # async for res in client.search_request(
+        # async for res in async_client.search_request(
         #     "DC=domain,DC=test",
         #     filter=sansldap.FilterEquality("objectClass", b"user"),
         #     scope=sansldap.SearchScope.SUBTREE,

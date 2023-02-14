@@ -6,7 +6,7 @@ from __future__ import annotations
 import dataclasses
 import typing as t
 
-from .asn1 import ASN1Reader, ASN1Writer, TagClass, TypeTagNumber
+from .asn1 import ASN1Header, ASN1Reader, ASN1Writer, TagClass, TypeTagNumber
 
 
 def unpack_ldap_control(
@@ -36,16 +36,28 @@ def unpack_ldap_control(
     )
     criticality = False
 
-    next_header = control_reader.peek_header()
-    if next_header.tag.tag_class == TagClass.UNIVERSAL and next_header.tag.tag_number == TypeTagNumber.BOOLEAN:
+    next_header: t.Optional[ASN1Header] = None
+    if control_reader:
+        next_header = control_reader.peek_header()
+
+    if (
+        next_header
+        and next_header.tag.tag_class == TagClass.UNIVERSAL
+        and next_header.tag.tag_number == TypeTagNumber.BOOLEAN
+    ):
         criticality = control_reader.read_boolean(
             header=next_header,
             hint="Control.criticality",
         )
-        next_header = control_reader.peek_header()
+        if control_reader:
+            next_header = control_reader.peek_header()
 
     control_value: t.Optional[bytes] = None
-    if next_header.tag.tag_class == TagClass.UNIVERSAL and next_header.tag.tag_number == TypeTagNumber.OCTET_STRING:
+    if (
+        next_header
+        and next_header.tag.tag_class == TagClass.UNIVERSAL
+        and next_header.tag.tag_number == TypeTagNumber.OCTET_STRING
+    ):
         control_value = control_reader.read_octet_string(
             header=next_header,
             hint="Control.controlValue",
@@ -112,7 +124,8 @@ class LDAPControl:
 
             @dataclasses.dataclass
             class CustomControl(LDAPControl):
-                control_type = dataclasses.field(init=False, repr=False, default="1.2.3.4")
+                control_type: str = dataclasses.field(init=False, repr=False, default="1.2.3.4")
+                value: t.Optional[bytes] = dataclasses.field(init=False, repr=False, default=None)
 
                 size: int
 
@@ -129,7 +142,7 @@ class LDAPControl:
                     critical: bool,
                     value: t.Optional[bytes],
                     options: ControlOptions,
-                ) -> PagedResultControl:
+                ) -> CustomControl:
                     size = struct.unpack("<I", (value or b""))[0]
 
                     return CustomControl(critical=critical, size=size)
@@ -151,7 +164,7 @@ class LDAPControl:
 
     control_type: str
     critical: bool
-    value: t.Optional[bytes] = None
+    value: t.Optional[bytes]
 
     def pack(
         self,

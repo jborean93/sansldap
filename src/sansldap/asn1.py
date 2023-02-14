@@ -170,7 +170,7 @@ class ASN1Reader:
             header: The header which contains the metadata of the next value to
                 skip.
         """
-        self._value = self._view[header.tag_length + header.length :]
+        self._view = self._view[header.tag_length + header.length :]
 
     def get_remaining_data(self) -> bytes:
         """Gets the remaining data in the reader."""
@@ -544,7 +544,7 @@ class ASN1Writer:
             bytearray: The data that has been written.
         """
         if self._parent or self._tag:
-            raise TypeError("Cannot all get_data() on child ASN1 writer")
+            raise TypeError("Cannot get_data() on child ASN1 writer")
 
         return self._data
 
@@ -676,7 +676,9 @@ def _pack_asn1_integer(
     b_int.append(((0xFF - value) if is_negative else value) & 0xFF)
 
     if is_negative:
-        for idx, val in enumerate(b_int):
+        # The nocover is here because it's reporting no coverage for the no
+        # enumerate branch. We don't care about that.
+        for idx, val in enumerate(b_int):  # pragma: nocover
             if val < 0xFF:
                 b_int[idx] += 1
                 break
@@ -741,7 +743,7 @@ def _read_asn1_header(
     length = struct.unpack("B", view[:1])[0]
     length_octets = 1
 
-    if length == 0b1000000:
+    if length == 0b10000000:
         # Indefinite length, the length is not known and will be marked by two
         # NULL octets known as end-of-content octets later in the stream. It is
         # not meant to be sent in LDAP so fail here.
@@ -818,7 +820,8 @@ def _read_asn1_integer(
         for i in range(len(b_int)):
             b_int[i] = 0xFF - b_int[i]
 
-        for i in range(len(b_int) - 1, -1, -1):
+        # Coverage is skipped because branch will not occur with no loop
+        for i in range(len(b_int) - 1, -1, -1):  # pragma: nocover
             if b_int[i] == 0xFF:
                 b_int[i - 1] += 1
                 b_int[i] = 0
