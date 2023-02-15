@@ -22,10 +22,13 @@ from ._messages import (
     LDAPResult,
     LDAPResultCode,
     PackingOptions,
+    PartialAttribute,
     Request,
     Response,
     SearchRequest,
     SearchResultDone,
+    SearchResultEntry,
+    SearchResultReference,
     SearchScope,
     UnbindRequest,
     unpack_ldap_message,
@@ -123,6 +126,7 @@ class LDAPSession:
 
         self._outgoing_buffer = bytearray()
         self._outstanding_requests: t.Set[int] = set()
+        self._search_requests: t.Set[int] = set()
         self._packing_options = PackingOptions(
             string_encoding=string_encoding,
             authentication=AuthenticationOptions(string_encoding=string_encoding),
@@ -235,6 +239,8 @@ class LDAPSession:
                 self._process_incoming_message(msg)
 
         except (ValueError, NotImplementedError) as e:
+            self.state = SessionState.CLOSED
+            self._outstanding_requests = set()
             raise ProtocolError(f"Received invalid data from the peer, connection closing: {e}") from e
 
         except ProtocolError:
@@ -301,7 +307,7 @@ class LDAPSession:
             filter: The custom LDAP filter type to register.
         """
         existing = next(
-            (f for f in self._packing_options.filter.choices if f.filter_id == f.filter_id),
+            (f for f in self._packing_options.filter.choices if filter.filter_id == f.filter_id),
             None,
         )
         if existing:
@@ -339,7 +345,10 @@ class LDAPSession:
         if self.state == SessionState.CLOSED:
             raise LDAPError("LDAP session is CLOSED, cannot send any new messages.")
 
-        elif self.state == SessionState.BINDING and not isinstance(msg, (UnbindRequest, BindRequest, BindResponse)):
+        elif self.state == SessionState.BINDING and (
+            not isinstance(msg, (UnbindRequest, BindRequest, BindResponse))
+            and not (isinstance(msg, ExtendedResponse) and msg.name == ExtendedOperations.LDAP_NOTICE_OF_DISCONNECTION)
+        ):
             raise LDAPError(
                 f"LDAP session is BINDING, can only send a BindRequest, BindResponse, or UnbindRequest not {type(msg).__name__}"
             )
@@ -361,7 +370,6 @@ class LDAPClient(LDAPSession):
     def __init__(self) -> None:
         super().__init__()
         self._message_counter = 1
-        self._search_requests: t.Set[int] = set()
 
     def bind_simple(
         self,
@@ -615,7 +623,7 @@ class LDAPClient(LDAPSession):
                 not isinstance(e.request, UnbindRequest)
                 and not (
                     isinstance(e.request, ExtendedResponse)
-                    and e.request.name == ExtendedOperations.LDAP_NOTICE_OF_DISCONNECTION.name
+                    and e.request.name == ExtendedOperations.LDAP_NOTICE_OF_DISCONNECTION.value
                 )
             ):
                 msg = UnbindRequest(
@@ -644,7 +652,7 @@ class LDAPClient(LDAPSession):
         elif msg.message_id not in self._outstanding_requests:
             raise ProtocolError(f"Received unexpected message id response {msg.message_id} from server")
 
-        if isinstance(msg, BindResponse) and msg.result.result_code == LDAPResultCode.SUCCESS:
+        if isinstance(msg, BindResponse) and msg.result.result_code != LDAPResultCode.SASL_BIND_IN_PROGRESS:
             self.state = SessionState.OPENED
 
         if remove_id:
@@ -687,8 +695,8 @@ class LDAPServer(LDAPSession):
     ) -> int:
         """Send a Bind Response.
 
-        Responds to a bind request. If the result_code is ``SUCCESS``, the
-        state will be updated to ``OPENED``.
+        Responds to a bind request. The state will be changed to ``OPENED``
+        unless the result code is ``SASL_BIND_IN_PROGRESS``.
 
         Args:
             message_id: The message id this is responding to.
@@ -702,7 +710,7 @@ class LDAPServer(LDAPSession):
             diagnostics_message: A string containing a textual diagnostic
                 message. This is not standardized and should not be parsed. It
                 is used for display purposes only on the client.
-            controls: Optional client controls to send with the request.
+            controls: Optional server controls to send with the request.
 
         Returns:
             int: The message id associated with the request.
@@ -718,8 +726,8 @@ class LDAPServer(LDAPSession):
             ),
             server_sasl_creds=sasl_creds,
         )
-        if result_code == LDAPResultCode.SUCCESS:
-            self.state == SessionState.OPENED
+        if result_code != LDAPResultCode.SASL_BIND_IN_PROGRESS:
+            self.state = SessionState.OPENED
 
         return self._send(msg)
 
@@ -751,7 +759,7 @@ class LDAPServer(LDAPSession):
             diagnostics_message: A string containing a textual diagnostic
                 message. This is not standardized and should not be parsed. It
                 is used for display purposes only on the client.
-            controls: Optional client controls to send with the request.
+            controls: Optional server controls to send with the request.
 
         Returns:
             int: The message id associated with the request.
@@ -768,7 +776,113 @@ class LDAPServer(LDAPSession):
             name=name,
             value=value,
         )
+        msg_id = self._send(msg)
+        if name == ExtendedOperations.LDAP_NOTICE_OF_DISCONNECTION:
+            self.state = SessionState.CLOSED
+
+        return msg_id
+
+    def search_result_entry(
+        self,
+        message_id: int,
+        object_name: str,
+        attributes: t.List[PartialAttribute],
+        controls: t.Optional[t.List[LDAPControl]] = None,
+    ) -> int:
+        """Send a Search Result Entry Response.
+
+        Responds to a search request with an entry result. This contains the
+        search results for the object specified. A search result can have
+        more than 1 result entry depending on what is found. The search
+        result is finalised when :func:`search_result_done` is called.
+
+        Args:
+            message_id: The message id this is responding to.
+            object_name: The object the entry is associated with.
+            attributes: List of attributes and their values.
+            controls: Optional server controls to send with the request.
+
+        Returns:
+            int: The message id associated with the request.
+        """
+        msg = SearchResultEntry(
+            message_id=message_id,
+            controls=controls or [],
+            object_name=object_name,
+            attributes=attributes,
+        )
         return self._send(msg)
+
+    def search_result_reference(
+        self,
+        message_id: int,
+        uris: t.List[str],
+        controls: t.Optional[t.List[LDAPControl]] = None,
+    ) -> int:
+        """Send a Search Result Reference.
+
+        Responds to a search request with a reference result. This is a result
+        that indicates the server is unable, or unwilling, to search one or
+        more non-local entries. The message contains reference(s) to one or
+        more set of servers for the client to continue the operation.
+
+        Args:
+            message_id: The message id this is responding to.
+            uris: The references for the client.
+            controls: Optional server controls to send with the request.
+
+        Returns:
+            int: The message id associated with the request.
+        """
+        msg = SearchResultReference(
+            message_id=message_id,
+            controls=controls or [],
+            uris=uris,
+        )
+        return self._send(msg)
+
+    def search_result_done(
+        self,
+        message_id: int,
+        result_code: LDAPResultCode = LDAPResultCode.SUCCESS,
+        matched_dn: t.Optional[str] = None,
+        diagnostics_message: t.Optional[str] = None,
+        controls: t.Optional[t.List[LDAPControl]] = None,
+    ) -> int:
+        """Finish a Search Operation.
+
+        This is the final search operation response that indicates to the
+        client that the search is done and to expect no more responses for that
+        operation.
+
+        Args:
+            message_id: The message id this is responding to.
+            result_code: The result code. The default is ``SUCCESS`` which
+                means the bind was successful.
+            matched_dn: The subject the result is for. This is used for
+                diagnostic purposes by the client when receiving an
+                unsuccesful response.
+            diagnostics_message: A string containing a textual diagnostic
+                message. This is not standardized and should not be parsed. It
+                is used for display purposes only on the client.
+            controls: Optional server controls to send with the request.
+
+        Returns:
+            int: The message id associated with the request.
+        """
+        msg = SearchResultDone(
+            message_id=message_id,
+            controls=controls or [],
+            result=LDAPResult(
+                result_code=result_code,
+                matched_dn=matched_dn or "",
+                diagnostics_message=diagnostics_message or "",
+                referrals=[],
+            ),
+        )
+        msg_id = self._send(msg)
+        self._search_requests.remove(msg_id)
+        return msg_id
 
     def receive(
         self,
@@ -810,6 +924,9 @@ class LDAPServer(LDAPSession):
         elif self.state == SessionState.BEFORE_OPEN:
             self.state = SessionState.OPENED
 
+        if isinstance(msg, SearchRequest):
+            self._search_requests.add(msg.message_id)
+
         self._outstanding_requests.add(msg.message_id)
         super()._process_incoming_message(msg)
 
@@ -821,7 +938,8 @@ class LDAPServer(LDAPSession):
 
         if not isinstance(msg, UnbindRequest):
             if msg_id in self._outstanding_requests:
-                self._outstanding_requests.remove(msg_id)
+                if not isinstance(msg, (SearchResultEntry, SearchResultReference)):
+                    self._outstanding_requests.remove(msg_id)
             else:
                 raise LDAPError(f"Message {msg} is a response to an unknown request")
 
