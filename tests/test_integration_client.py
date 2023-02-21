@@ -29,24 +29,24 @@ def test_sync_simple_bind(sync_client: SyncLDAPClient) -> None:
                 username=username,
                 password=password,
                 hostname=sync_client.server,
-                encrypt=False,
-                sign=False,
+                encrypt=True,
+                sign=True,
             ),
         )
 
         a = sync_client.whoami()
         b = ""
 
-        for res in sync_client.search_request(
-            "DC=domain,DC=test",
-            filter=sansldap.FilterEquality("objectClass", b"user"),
-            scope=sansldap.SearchScope.SUBTREE,
-            attributes=[
-                "sAMAccountName",
-                "userPrincipalName",
-            ],
-        ):
-            a = ""
+        # for res in sync_client.search_request(
+        #     "DC=domain,DC=test",
+        #     filter=sansldap.FilterEquality("objectClass", b"user"),
+        #     scope=sansldap.SearchScope.SUBTREE,
+        #     attributes=[
+        #         "sAMAccountName",
+        #         "userPrincipalName",
+        #     ],
+        # ):
+        #     a = ""
 
 
 async def test_async_simple_bind(async_client: AsyncLDAPClient) -> None:

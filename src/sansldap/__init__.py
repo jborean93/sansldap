@@ -2,6 +2,7 @@
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
 import sansldap.asn1 as asn1
+import sansldap.schema as schema
 
 from ._authentication import (
     AuthenticationCredential,
@@ -92,6 +93,7 @@ __all__ = [
     "PartialAttribute",
     "ProtocolError",
     "SaslCredential",
+    "schema",
     "SearchRequest",
     "SearchResultDone",
     "SearchResultEntry",
