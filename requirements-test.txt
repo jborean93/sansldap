@@ -7,3 +7,4 @@ pyspnego[kerberos]
 pytest
 pytest-asyncio
 pytest-cov
+types-cryptography
