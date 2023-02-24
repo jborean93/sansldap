@@ -106,7 +106,12 @@ jobs:
 
     - name: Test
       shell: bash
-      run: build_helpers/run-ci.sh
+      run: |
+        if [ "$(expr substr $(uname -s) 1 5)" == "MINGW" ]; then
+            build_helpers/run-ci.sh
+        else
+            sudo -E build_helpers/run-ci.sh
+        fi
       env:
         PYTEST_ADDOPTS: --color=yes
 
