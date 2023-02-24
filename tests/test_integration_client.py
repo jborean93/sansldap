@@ -34,6 +34,51 @@ def test_sync_simple_bind(sync_client: SyncLDAPClient) -> None:
             ),
         )
 
+        root_dse = next(
+            res
+            for res in sync_client.search_request(
+                "",
+                scope=sansldap.SearchScope.BASE,
+                attributes=["subschemaSubentry"],
+            )
+            if isinstance(res, sansldap.SearchResultEntry)
+        )
+
+        attribute_types = []
+        content_rules = []
+        object_classes = []
+
+        for res in sync_client.search_request(
+            root_dse.attributes[0].values[0].decode("utf-8"),
+            scope=sansldap.SearchScope.BASE,
+            attributes=[
+                "attributeTypes",
+                "dITContentRules",
+                "objectClasses",
+            ],
+        ):
+            if not isinstance(res, sansldap.SearchResultEntry):
+                continue
+
+            for attr in res.attributes:
+                if attr.name == "attributeTypes":
+                    for attr_type in attr.values:
+                        attribute_types.append(
+                            sansldap.schema.AttributeTypeDescription.from_string(attr_type.decode("utf-8"))
+                        )
+
+                elif attr.name == "dITContentRules":
+                    for content_rule in attr.values:
+                        content_rules.append(
+                            sansldap.schema.DITContentRuleDescription.from_string(content_rule.decode("utf-8"))
+                        )
+
+                elif attr.name == "objectClasses":
+                    for obj_class in attr.values:
+                        object_classes.append(
+                            sansldap.schema.ObjectClassDescription.from_string(obj_class.decode("utf-8"))
+                        )
+
         a = sync_client.whoami()
         b = ""
 

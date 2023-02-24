@@ -168,7 +168,7 @@ class SyncLDAPClient:
         filter: t.Optional[t.Union[str, sansldap.LDAPFilter]] = None,
         attributes: t.Optional[t.List[str]] = None,
         controls: t.Optional[t.List[sansldap.LDAPControl]] = None,
-    ) -> t.Iterator[t.Union[sansldap.SearchResultReference, sansldap.SearchResultEntry]]:
+    ) -> t.Iterator[t.Union[sansldap.SearchResultDone, sansldap.SearchResultReference, sansldap.SearchResultEntry]]:
         ldap_filter: t.Optional[sansldap.LDAPFilter] = None
         if isinstance(filter, sansldap.LDAPFilter):
             ldap_filter = filter
@@ -198,6 +198,8 @@ class SyncLDAPClient:
             for res in handler:
                 if isinstance(res, sansldap.SearchResultDone):
                     self._valid_result(res.result, "search request failed")
+
+                    yield res
                     break
 
                 else:

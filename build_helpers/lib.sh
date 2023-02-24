@@ -1,6 +1,50 @@
 #!/bin/bash
 
 
+lib::setup::debian_requirements() {
+    echo "Installing Debian based pre-requisites"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+
+    if [ x"$GSSAPI_PROVIDER" = "xheimdal" ]; then
+        echo "Installing Heimdal packages for Debian"
+        apt-get -y install \
+            heimdal-{clients,dev,kdc}
+
+        export PATH="/usr/lib/heimdal-servers:${PATH}"
+
+    else
+        echo "Installing MIT Kerberos packages for Debian"
+        apt-get -y install \
+            gss-ntlmssp \
+            krb5-{user,kdc,admin-server,multidev} \
+            libkrb5-dev
+    fi
+}
+
+lib::setup::system_requirements() {
+    if [ x"${GITHUB_ACTIONS}" = "xtrue" ]; then
+        echo "::group::Installing System Requirements"
+    fi
+
+    if [ -f /etc/debian_version ]; then
+        lib::setup::debian_requirements
+
+    elif [ "$(uname)" == "Darwin" ]; then
+        echo "No system requirements required for macOS"
+
+    elif [ "$(expr substr $(uname -s) 1 5)" == "MINGW" ]; then
+        echo "No system requirements required for Windows"
+
+    else
+        echo "Distro not found!"
+    fi
+
+    if [ x"${GITHUB_ACTIONS}" = "xtrue" ]; then
+        echo "::endgroup::"
+    fi
+}
+
 lib::setup::python_requirements() {
     if [ x"${GITHUB_ACTIONS}" = "xtrue" ]; then
         echo "::group::Installing Python Requirements"

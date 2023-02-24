@@ -208,7 +208,9 @@ class AsyncLDAPClient:
         filter: t.Optional[t.Union[str, sansldap.LDAPFilter]] = None,
         attributes: t.Optional[t.List[str]] = None,
         controls: t.Optional[t.List[sansldap.LDAPControl]] = None,
-    ) -> t.AsyncIterator[t.Union[sansldap.SearchResultEntry, sansldap.SearchResultReference]]:
+    ) -> t.AsyncIterator[
+        t.Union[sansldap.SearchResultDone, sansldap.SearchResultEntry, sansldap.SearchResultReference]
+    ]:
         ldap_filter: t.Optional[sansldap.LDAPFilter] = None
         if isinstance(filter, sansldap.LDAPFilter):
             ldap_filter = filter
@@ -238,6 +240,8 @@ class AsyncLDAPClient:
             async for res in handler:
                 if isinstance(res, sansldap.SearchResultDone):
                     self._valid_result(res.result, "search request failed")
+
+                    yield res
                     break
 
                 else:
