@@ -1437,7 +1437,7 @@ class TestFilterExtensibleMatch:
         assert actual.value == b"value"
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class CustomFilter(f.LDAPFilter):
     filter_id: int = dataclasses.field(init=False, repr=False, default=1024)
 

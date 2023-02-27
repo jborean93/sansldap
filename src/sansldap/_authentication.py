@@ -33,7 +33,7 @@ class AuthenticationOptions:
     "List of known authentication types"
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class AuthenticationCredential:
     """Base class for Bind Request Authentication choices.
 
@@ -47,7 +47,7 @@ class AuthenticationCredential:
     Example:
         .. code-block:: python
 
-            @dataclasses.dataclass
+            @dataclasses.dataclass(frozen=True)
             class CustomAuth(a.AuthenticationCredential):
                 auth_id: int = dataclasses.field(init=False, repr=False, default=1024)
 
@@ -146,7 +146,7 @@ class AuthenticationCredential:
         raise NotImplementedError(f"Unknown authentication object {next_header.tag}, cannot unpack")
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class SimpleCredential(AuthenticationCredential):
     """The Simple Credential.
 
@@ -185,7 +185,7 @@ class SimpleCredential(AuthenticationCredential):
         return SimpleCredential(password=password)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class SaslCredential(AuthenticationCredential):
     """The SASL Credential.
 

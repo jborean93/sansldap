@@ -12,7 +12,7 @@ import pytest
 import sansldap
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class CustomAuth(sansldap.AuthenticationCredential):
     auth_id: int = dataclasses.field(init=False, repr=False, default=1024)
 
@@ -52,7 +52,7 @@ class CustomAuth(sansldap.AuthenticationCredential):
         return CustomAuth(username=username, password=password)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class CustomControl(sansldap.LDAPControl):
     control_type: str = dataclasses.field(init=False, repr=False, default="1.2.3.4")
     value: t.Optional[bytes] = dataclasses.field(init=False, repr=False, default=None)
@@ -78,7 +78,7 @@ class CustomControl(sansldap.LDAPControl):
         return CustomControl(critical=critical, size=size)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class CustomFilter(sansldap.LDAPFilter):
     filter_id: int = dataclasses.field(init=False, repr=False, default=1024)
 

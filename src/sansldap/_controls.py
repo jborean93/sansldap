@@ -70,7 +70,7 @@ def unpack_ldap_control(
         options=options,
     )
     # Ensures unpacking a control always has this value
-    control.value = control_value
+    object.__setattr__(control, "value", control_value)
 
     return control
 
@@ -97,7 +97,7 @@ class ControlOptions:
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class LDAPControl:
     """LDAP Control.
 
@@ -122,7 +122,7 @@ class LDAPControl:
     Example:
         .. code-block:: python
 
-            @dataclasses.dataclass
+            @dataclasses.dataclass(frozen=True)
             class CustomControl(LDAPControl):
                 control_type: str = dataclasses.field(init=False, repr=False, default="1.2.3.4")
                 value: t.Optional[bytes] = dataclasses.field(init=False, repr=False, default=None)
@@ -198,7 +198,7 @@ class LDAPControl:
         return LDAPControl(control_type, critical, value)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class _KnownControl(LDAPControl):
     """Used internally to separate known controls from unknown ones."""
 
@@ -206,7 +206,7 @@ class _KnownControl(LDAPControl):
     value: t.Optional[bytes] = dataclasses.field(init=False, default=None, repr=False)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class ShowDeletedControl(_KnownControl):
     """LDAP Show Deleted Control.
 
@@ -227,7 +227,7 @@ class ShowDeletedControl(_KnownControl):
         return ShowDeletedControl(critical=critical)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class ShowDeactivatedLinkControl(_KnownControl):
     """LDAP Show Deactivated Control
 
@@ -249,7 +249,7 @@ class ShowDeactivatedLinkControl(_KnownControl):
         return ShowDeactivatedLinkControl(critical=critical)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class PagedResultControl(_KnownControl):
     """Control for Simple Paged Results.
 
