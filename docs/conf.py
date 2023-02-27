@@ -65,6 +65,7 @@ source_suffix = {
     ".md": "markdown",
 }
 
+myst_all_links_external = True
 
 # -- Options for HTML output -------------------------------------------------
 
