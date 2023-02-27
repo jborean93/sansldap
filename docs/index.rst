@@ -20,6 +20,7 @@ More operations will be added in the future as needed.
    :maxdepth: 2
    :caption: Contents:
 
+   events
    source/modules
 
 Indices and tables
