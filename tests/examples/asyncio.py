@@ -194,7 +194,10 @@ class AsyncLDAPClient:
     async def close(self) -> None:
         """Closes the LDAP connection."""
         self._writer.close()
-        await self._writer.wait_closed()
+        try:
+            await self._writer.wait_closed()
+        except OSError:
+            pass
         await self._reader_task
 
     async def search_request(

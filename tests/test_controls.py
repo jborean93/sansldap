@@ -13,7 +13,7 @@ import sansldap._messages as m
 import sansldap.asn1
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class CustomControl(c.LDAPControl):
     control_type: str = dataclasses.field(init=False, repr=False, default="1.2.3.4")
     value: t.Optional[bytes] = dataclasses.field(init=False, repr=False, default=None)

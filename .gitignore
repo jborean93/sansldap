@@ -122,3 +122,8 @@ ENV/
 
 # vim
 *.swp
+
+### Custom entries ###
+tests/integration/.vagrant
+tests/integration/artifact.zip
+tests/integration/cert_setup

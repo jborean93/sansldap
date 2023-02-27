@@ -153,7 +153,10 @@ class SyncLDAPClient:
         self._valid_result(response.result, "simple bind failed")
 
     def close(self) -> None:
-        self._sock.shutdown(socket.SHUT_RDWR)
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # May have already been closed
         self._sock.close()
         self._reader_task.join()
 

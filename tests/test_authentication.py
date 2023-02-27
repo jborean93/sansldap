@@ -14,7 +14,7 @@ import sansldap._messages as m
 import sansldap.asn1
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class CustomAuth(a.AuthenticationCredential):
     auth_id: int = dataclasses.field(init=False, repr=False, default=1024)
 

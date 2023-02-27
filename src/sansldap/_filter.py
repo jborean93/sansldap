@@ -624,7 +624,7 @@ class FilterOptions:
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class LDAPFilter:
     """Base class for all LDAP filters.
 
@@ -652,7 +652,7 @@ class LDAPFilter:
     Example:
         .. code-block:: python
 
-            @dataclasses.dataclass
+            @dataclasses.dataclass(frozen=True)
             class CustomFilter(LDAPFilter):
                 filter_id: int = dataclasses.field(init=False, repr=False, default=1024)
 
@@ -783,7 +783,7 @@ class LDAPFilter:
         raise NotImplementedError(f"Unknown filter object {next_header.tag}, cannot unpack")
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterAnd(LDAPFilter):
     """LDAP Filter Any.
 
@@ -833,7 +833,7 @@ class FilterAnd(LDAPFilter):
         return FilterAnd(filters=filters)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterOr(LDAPFilter):
     """LDAP Filter Or.
 
@@ -883,7 +883,7 @@ class FilterOr(LDAPFilter):
         return FilterOr(filters=filters)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterNot(LDAPFilter):
     """LDAP Filter Not.
 
@@ -928,7 +928,7 @@ class FilterNot(LDAPFilter):
         return FilterNot(filter=not_filter)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterEquality(LDAPFilter):
     """LDAP Filter Equality.
 
@@ -975,7 +975,7 @@ class FilterEquality(LDAPFilter):
         return FilterEquality(attribute=attribute, value=value)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterSubstrings(LDAPFilter):
     """LDAP Filter Substrings.
 
@@ -1102,7 +1102,7 @@ class FilterSubstrings(LDAPFilter):
         )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterGreaterOrEqual(LDAPFilter):
     """LDAP Filter Greater Than.
 
@@ -1149,7 +1149,7 @@ class FilterGreaterOrEqual(LDAPFilter):
         return FilterGreaterOrEqual(attribute=attribute, value=value)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterLessOrEqual(LDAPFilter):
     """LDAP Filter Less Than.
 
@@ -1196,7 +1196,7 @@ class FilterLessOrEqual(LDAPFilter):
         return FilterLessOrEqual(attribute=attribute, value=value)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterPresent(LDAPFilter):
     """LDAP Filter Present.
 
@@ -1239,7 +1239,7 @@ class FilterPresent(LDAPFilter):
         return FilterPresent(attribute=value)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterApproxMatch(LDAPFilter):
     """LDAP Filter Approx Match.
 
@@ -1286,7 +1286,7 @@ class FilterApproxMatch(LDAPFilter):
         return FilterApproxMatch(attribute=attribute, value=value)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FilterExtensibleMatch(LDAPFilter):
     """LDAP Filter Extensible Match.
 

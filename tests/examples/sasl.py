@@ -98,7 +98,9 @@ class External(SaslProvider):
     This provider is used to signify an external channel is used to
     authenticate the client. An example would be TLS client authentication
     where the client certificate presented during the TLS handshake is used to
-    authenticate the client.
+    authenticate the client. This should only be used with a StartTLS bound
+    connection. Using LDAPS will automatically be bound to the user supplied
+    certificate in the TLS handshake.
     """
 
     def __init__(self) -> None:

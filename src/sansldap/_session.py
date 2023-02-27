@@ -668,7 +668,7 @@ class LDAPClient(LDAPSession):
             return super()._send(msg)
 
         msg_id = self._message_counter
-        msg.message_id = msg_id
+        object.__setattr__(msg, "message_id", msg_id)
 
         super()._send(msg)
 

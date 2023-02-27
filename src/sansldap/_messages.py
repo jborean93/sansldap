@@ -100,7 +100,7 @@ def unpack_ldap_message(
 
     # Need to inject the MS-ADTS extension to this message.
     if isinstance(msg, ExtendedResponse) and response_name and not msg.name:
-        msg.name = response_name
+        object.__setattr__(msg, "name", response_name)
 
     return msg
 
@@ -210,7 +210,7 @@ class Response:
     "Identifies LDAP responses"
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class LDAPMessage:
     """The base LDAP Message object.
 
@@ -298,7 +298,7 @@ class LDAPMessage:
         return
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class BindRequest(LDAPMessage, Request):
     """The bind request message.
 
@@ -368,7 +368,7 @@ def _unpack_bind_request(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class BindResponse(LDAPMessage, Response):
     """The bind response message.
 
@@ -439,7 +439,7 @@ def _unpack_bind_response(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class UnbindRequest(LDAPMessage, Request):
     """The unbind request message.
 
@@ -462,7 +462,7 @@ class UnbindRequest(LDAPMessage, Request):
     # UnbindRequest ::= [APPLICATION 2] NULL
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class SearchRequest(LDAPMessage, Request):
     """The search request message.
 
@@ -595,7 +595,7 @@ def _unpack_search_request(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class SearchResultEntry(LDAPMessage, Response):
     """The search result entry message.
 
@@ -669,7 +669,7 @@ def _unpack_search_result_entry(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class SearchResultDone(LDAPMessage, Response):
     """The search result done message.
 
@@ -715,7 +715,7 @@ def _unpack_search_result_done(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class SearchResultReference(LDAPMessage, Response):
     """The search result reference message.
 
@@ -773,7 +773,7 @@ def _unpack_search_result_reference(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class ExtendedRequest(LDAPMessage, Request):
     """The extended request message.
 
@@ -862,7 +862,7 @@ def _unpack_extended_request(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class ExtendedResponse(LDAPMessage, Response):
     """The extended response message.
 
@@ -960,7 +960,7 @@ def _unpack_extended_response(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class LDAPResult:
     """The LDAPResult message.
 
@@ -1102,7 +1102,7 @@ def _unpack_ldap_result(
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class PartialAttribute:
     """The PartialAttribute object.
 
