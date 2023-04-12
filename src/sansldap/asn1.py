@@ -238,6 +238,22 @@ class ASN1Reader:
 
         return enum_type(val)
 
+    def read_generalized_time(
+        self,
+        tag: t.Optional[ASN1Tag] = None,
+        header: t.Optional[ASN1Header] = None,
+        hint: t.Optional[str] = None,
+    ) -> str:
+        val, consumed = _read_asn1_generalized_time(
+            self._view,
+            tag=tag,
+            header=header,
+            hint=hint,
+        )
+        self._view = self._view[consumed:]
+
+        return val
+
     def read_integer(
         self,
         tag: t.Optional[ASN1Tag] = None,
@@ -258,6 +274,22 @@ class ASN1Reader:
             int: The int value.
         """
         val, consumed = _read_asn1_integer(
+            self._view,
+            tag=tag,
+            header=header,
+            hint=hint,
+        )
+        self._view = self._view[consumed:]
+
+        return val
+
+    def read_object_identifier(
+        self,
+        tag: t.Optional[ASN1Tag] = None,
+        header: t.Optional[ASN1Header] = None,
+        hint: t.Optional[str] = None,
+    ) -> str:
+        val, consumed = _read_asn1_object_identifier(
             self._view,
             tag=tag,
             header=header,
@@ -801,6 +833,20 @@ def _read_asn1_enumerated(
     return _read_asn1_integer(data, tag, header=header, hint=hint)
 
 
+def _read_asn1_generalized_time(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[str, int]:
+    """Unpacks an ASN.1 GENERALIZED_TIME value."""
+    if not tag:
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.GENERALIZED_TIME, False)
+
+    raw_time, consumed = _validate_tag(data, tag, header=header, hint=hint)
+    return raw_time.tobytes().decode("utf-8"), consumed
+
+
 def _read_asn1_integer(
     data: t.Union[bytes, bytearray, memoryview],
     tag: t.Optional[ASN1Tag] = None,
@@ -839,6 +885,31 @@ def _read_asn1_integer(
         int_value *= -1
 
     return int_value, consumed
+
+
+def _read_asn1_object_identifier(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[str, int]:
+    """Unpacks an ASN.1 OBJECT_IDENTIFIER value."""
+    if not tag:
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.OBJECT_IDENTIFIER, False)
+
+    raw_oid, consumed = _validate_tag(data, tag, header=header, hint=hint)
+
+    first_element = struct.unpack("B", raw_oid[:1])[0]
+    second_element = first_element % 40
+    ids = [(first_element - second_element) // 40, second_element]
+
+    idx = 1
+    while idx != len(raw_oid):
+        oid, octet_len = _unpack_asn1_octet_number(raw_oid[idx:])
+        ids.append(oid)
+        idx += octet_len
+
+    return ".".join([str(i) for i in ids]), consumed
 
 
 def _read_asn1_octet_string(
