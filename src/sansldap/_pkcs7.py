@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import dataclasses
+import struct
 import typing as t
+import uuid
 
 from .asn1 import ASN1Header, ASN1Reader, ASN1Tag, ASN1Writer, TagClass, TypeTagNumber
 
@@ -297,4 +299,65 @@ class AlgorithmIdentifier:
         return AlgorithmIdentifier(
             algorithm=algorithm,
             parameters=parameters,
+        )
+
+
+@dataclasses.dataclass
+class ManagedPasswordId:
+    # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf
+    # 2.2.4 Group Key Envelope
+    # This struct seems similar (the magic matches) but the real data seems to
+    # be missing a few fields. Anything beyond the root_key_identifier is guess
+    # work based on the data seen.
+    version: int
+    is_public_key: bool
+    l0_index: int
+    l1_index: int
+    l2_index: int
+    root_key_identifier: uuid.UUID
+    something: bytes
+    domain_name: str
+    forest_name: str
+
+    @classmethod
+    def unpack(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> ManagedPasswordId:
+        view = memoryview(data)
+
+        version = struct.unpack("<I", view[:4])[0]
+
+        assert view[4:8].tobytes() == b"\x4B\x44\x53\x4B"
+
+        is_public_key = struct.unpack("<I", view[8:12])[0] == 1
+        l0_index = struct.unpack("<I", view[12:16])[0]
+        l1_index = struct.unpack("<I", view[16:20])[0]
+        l2_index = struct.unpack("<I", view[20:24])[0]
+        root_key_identifier = uuid.UUID(bytes_le=view[24:40].tobytes())
+        something_length = struct.unpack("<I", view[40:44])[0]
+        domain_len = struct.unpack("<I", view[44:48])[0]
+        forest_len = struct.unpack("<I", view[48:52])[0]
+        view = view[52:]
+
+        something = view[:something_length].tobytes()
+        view = view[something_length:]
+
+        # Take away 2 for the final null padding
+        domain = view[: domain_len - 2].tobytes().decode("utf-16-le")
+        view = view[domain_len:]
+
+        forest = view[: forest_len - 2].tobytes().decode("utf-16-le")
+        view = view[forest_len:]
+
+        return ManagedPasswordId(
+            version=version,
+            is_public_key=is_public_key,
+            l0_index=l0_index,
+            l1_index=l1_index,
+            l2_index=l2_index,
+            root_key_identifier=root_key_identifier,
+            something=something,
+            domain_name=domain,
+            forest_name=forest,
         )
