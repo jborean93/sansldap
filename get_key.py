@@ -6,7 +6,6 @@ import struct
 import typing as t
 import uuid
 
-import debugpy
 import gssapi
 import gssapi.raw
 import spnego
@@ -16,6 +15,7 @@ from sansldap._pkcs7 import (
     ContentInfo,
     EnvelopedData,
     KEKRecipientInfo,
+    GroupKeyEnvelope,
     ManagedPasswordId,
     NCryptProtectionDescriptor,
 )
@@ -202,6 +202,7 @@ def create_bind(
     version_major: int,
     version_minor: int,
     token: bytes,
+    sign_header: bool = False,
 ) -> bytes:
     bind_negotiation = uuid.UUID("6cb71c2c-9812-4540-0300-000000000000")
 
@@ -238,7 +239,7 @@ def create_bind(
 
     return create_pdu(
         packet_type=11,
-        packet_flags=0x07,
+        packet_flags=0x03 | (0x4 if sign_header else 0x0),
         call_id=1,
         header_data=bytes(bind_data),
         sec_trailer=auth_data,
@@ -250,6 +251,7 @@ def create_alter_context(
     version_major: int,
     version_minor: int,
     token: bytes,
+    sign_header: bool = False,
 ) -> bytes:
     ctx1 = b"\x01\x00\x01\x00"
     ctx1 += service_id.bytes_le
@@ -274,7 +276,7 @@ def create_alter_context(
 
     return create_pdu(
         packet_type=14,
-        packet_flags=0x07,
+        packet_flags=0x03 | (0x4 if sign_header else 0x0),
         call_id=1,
         header_data=bytes(alter_context_data),
         sec_trailer=auth_data,
@@ -285,6 +287,7 @@ def create_request(
     opnum: int,
     data: bytes,
     ctx: gssapi.SecurityContext,
+    sign_header: bool = False,
 ) -> bytes:
     # Add Verification trailer to data
     # MS-RPCE 2.2.2.13 Veritifcation Trailer
@@ -307,107 +310,81 @@ def create_request(
     data += b"\x00" * data_padding
 
     data += verification_trailer
+    alloc_hint = len(data)
     auth_padding = -len(data) % 16
     data += b"\x00" * auth_padding
 
     request_data = bytearray()
-    request_data += struct.pack("<I", 216)  # Alloc hint
+    request_data += struct.pack("<I", alloc_hint)
     request_data += struct.pack("<H", 1)  # Context id
     request_data += struct.pack("<H", opnum)
 
-    pdu = bytearray(
-        create_pdu(
+    if sign_header:
+        raise NotImplementedError()
+
+        # I have no idea what is actually signed. I'm guessing it's the PDU header
+        # with a blanked out fragment length field but this probably needs tweaking.
+        # memoryview(pdu)[8:10] = b"\x00\x00"
+
+        # iov_buffers = gssapi.raw.IOV(
+        #     gssapi.raw.IOVBufferType.header,
+        #     (gssapi.raw.IOVBufferType.sign_only, pdu),
+        #     data,
+        #     std_layout=False,
+        # )
+        # gssapi.raw.wrap_iov(
+        #     ctx,
+        #     message=iov_buffers,
+        #     confidential=True,
+        #     qop=None,
+        # )
+
+        # sec_trailer = SecTrailer(
+        #     type=9,  # SPNEGO
+        #     level=6,  # Packet Privacy
+        #     pad_length=auth_padding,
+        #     context_id=0,
+        #     data=iov_buffers[0].value or b"",
+        # )
+
+        # return create_pdu(
+        #     packet_type=0,
+        #     packet_flags=0x03,
+        #     call_id=1,
+        #     header_data=bytes(request_data),
+        #     stub_data=iov_buffers[2].value,
+        #     sec_trailer=sec_trailer,
+        # )
+
+    else:
+        iov_buffers = gssapi.raw.IOV(
+            gssapi.raw.IOVBufferType.header,
+            data,
+            std_layout=False,
+        )
+        gssapi.raw.wrap_iov(
+            ctx,
+            message=iov_buffers,
+            confidential=True,
+            qop=None,
+        )
+
+        sec_trailer = SecTrailer(
+            type=9,  # SPNEGO
+            level=6,  # Packet Privacy
+            pad_length=auth_padding,
+            context_id=0,
+            data=iov_buffers[0].value or b"",
+        )
+
+        return create_pdu(
             packet_type=0,
             packet_flags=0x03,
             call_id=1,
             header_data=bytes(request_data),
-            # stub_data=data,
-            # sec_trailer=sec_trailer,
+            stub_data=iov_buffers[1].value,
+            sec_trailer=sec_trailer,
         )
-    )
-
-    # I have no idea what is actually signed. I'm guessing it's the PDU header
-    # with a blanked out fragment length field but this probably needs tweaking.
-    memoryview(pdu)[8:10] = b"\x00\x00"
-
-    iov_buffers = gssapi.raw.IOV(
-        gssapi.raw.IOVBufferType.header,
-        (gssapi.raw.IOVBufferType.sign_only, pdu),
-        data,
-        std_layout=False,
-    )
-    gssapi.raw.wrap_iov(
-        ctx,
-        message=iov_buffers,
-        confidential=True,
-        qop=None,
-    )
-
-    sec_trailer = SecTrailer(
-        type=9,  # SPNEGO
-        level=6,  # Packet Privacy
-        pad_length=auth_padding,
-        context_id=0,
-        data=iov_buffers[0].value or b"",
-    )
-
-    return create_pdu(
-        packet_type=0,
-        packet_flags=0x03,
-        call_id=1,
-        header_data=bytes(request_data),
-        stub_data=iov_buffers[2].value,
-        sec_trailer=sec_trailer,
-    )
-
-
-def get_fault_pdu_error(data: memoryview) -> int:
-    status = struct.unpack("<I", data[24:28])[0]
-
-    return status
-
-
-def parse_bind_ack(data: bytes) -> bytes:
-    view = memoryview(data)
-
-    pkt_type = struct.unpack("B", view[2:3])[0]
-    if pkt_type == 3:
-        err = get_fault_pdu_error(view)
-        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
-
-    assert pkt_type == 12
-
-    auth_length = struct.unpack("<H", view[10:12])[0]
-    auth_blob = view[-auth_length:].tobytes()
-
-    return auth_blob
-
-
-def parse_alter_context(data: bytes) -> bytes:
-    view = memoryview(data)
-
-    pkt_type = struct.unpack("B", view[2:3])[0]
-    if pkt_type == 3:
-        err = get_fault_pdu_error(view)
-        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
-
-    assert pkt_type == 15
-
-    auth_length = struct.unpack("<H", view[10:12])[0]
-    auth_blob = view[-auth_length:].tobytes()
-
-    return auth_blob
-
-
-def parse_response(data: bytes) -> None:
-    view = memoryview(data)
-
-    pkt_type = struct.unpack("B", view[2:3])[0]
-    if pkt_type == 3:  # False
-        err = get_fault_pdu_error(view)
-        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
-
-    assert pkt_type == 12
 
 
 def create_get_key_request(
@@ -468,50 +445,112 @@ def create_get_key_request(
     # L2KeyID
     data += struct.pack("<I", l2)
 
-    # This is what has been seen on the wire in a real request.
-    # actual = (
-    #     # cbTargetSD - Should be a ULONG not ULONG64
-    #     # Maybe more padding for 8 byte boundaries
-    #     b"\x6C\x00\x00\x00\x00\x00\x00\x00"
-    #     # pbTargetSD
-    #     # The length of the pointer?
-    #     b"\x6C\x00\x00\x00\x00\x00\x00\x00"
-    #     # This is the SDDL as a binary string
-    #     # It is 108 bytes long
-    #     b"\x01\x00\x04\x80\x54\x00\x00\x00"
-    #     b"\x60\x00\x00\x00\x00\x00\x00\x00"
-    #     b"\x14\x00\x00\x00\x02\x00\x40\x00"
-    #     b"\x02\x00\x00\x00\x00\x00\x24\x00"
-    #     b"\x03\x00\x00\x00"
-    #     # The SID from the LAPS payload in binary form
-    #     b"\x01\x05\x00\x00"
-    #     b"\x00\x00\x00\x05\x15\x00\x00\x00"
-    #     b"\x1D\x93\x77\xF7\x44\x35\x7A\xCC"
-    #     b"\x8C\xD3\x7B\xA9\x00\x02\x00\x00"
-    #     b"\x00\x00\x14\x00\x02\x00\x00\x00"
-    #     b"\x01\x01\x00\x00\x00\x00\x00\x01"
-    #     b"\x00\x00\x00\x00\x01\x01\x00\x00"
-    #     b"\x00\x00\x00\x05\x12\x00\x00\x00"
-    #     b"\x01\x01\x00\x00\x00\x00\x00\x05"
-    #     b"\x12\x00\x00\x00"
-    #     # end pbTargetSD
-    #     # Maybe padding to align with 8 byte boundaries?
-    #     b"\x00\x00\x00\x00"
-    #     # pRootKeyID
-    #     # This looks to be the referent ID
-    #     b"\x00\x00\x02\x00\x00\x00\x00\x00"
-    #     # This is the GUID portion - bac64fa8-e890-917c-1090-83e7b0f85996
-    #     b"\xA8\x4F\xC6\xBA\x90\xE8\x7C\x91"
-    #     b"\x10\x90\x83\xE7\xB0\xF8\x59\x96"
-    #     # L0KeyID - 361
-    #     b"\x69\x01\x00\x00"
-    #     # L1KeyID - 15
-    #     b"\x0F\x00\x00\x00"
-    #     # L2KeyID - 17
-    #     b"\x11\x00\x00\x00"
-    # )
-
     return bytes(data)
+
+
+def get_fault_pdu_error(data: memoryview) -> int:
+    status = struct.unpack("<I", data[24:28])[0]
+
+    return status
+
+
+def parse_bind_ack(data: bytes) -> bytes:
+    view = memoryview(data)
+
+    pkt_type = struct.unpack("B", view[2:3])[0]
+    if pkt_type == 3:
+        err = get_fault_pdu_error(view)
+        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
+
+    assert pkt_type == 12
+
+    auth_length = struct.unpack("<H", view[10:12])[0]
+    auth_blob = view[-auth_length:].tobytes()
+
+    return auth_blob
+
+
+def parse_alter_context(data: bytes) -> bytes:
+    view = memoryview(data)
+
+    pkt_type = struct.unpack("B", view[2:3])[0]
+    if pkt_type == 3:
+        err = get_fault_pdu_error(view)
+        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
+
+    assert pkt_type == 15
+
+    auth_length = struct.unpack("<H", view[10:12])[0]
+    auth_blob = view[-auth_length:].tobytes()
+
+    return auth_blob
+
+
+def parse_response(
+    data: bytes,
+    ctx: gssapi.SecurityContext,
+    sign_header: bool = False,
+) -> bytes:
+    view = memoryview(data)
+
+    pkt_type = struct.unpack("B", view[2:3])[0]
+    if pkt_type == 3:  # False
+        err = get_fault_pdu_error(view)
+        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
+
+    assert pkt_type == 2
+    frag_length = struct.unpack("<H", view[8:10])[0]
+    auth_length = struct.unpack("<H", view[10:12])[0]
+
+    assert len(view) == frag_length
+    auth_data = view[-(auth_length + 8) :]
+    stub_data = view[24 : len(view) - (auth_length + 8)]
+
+    padding = struct.unpack("B", auth_data[2:3])[0]
+
+    if sign_header:
+        raise NotImplementedError()
+
+    else:
+        iov_buffers = gssapi.raw.IOV(
+            (gssapi.raw.IOVBufferType.header, False, auth_data[8:].tobytes()),
+            stub_data.tobytes(),
+            std_layout=False,
+        )
+        gssapi.raw.unwrap_iov(
+            ctx,
+            message=iov_buffers,
+        )
+
+        decrypted_stub = iov_buffers[1].value or b""
+        return decrypted_stub[: len(decrypted_stub) - padding]
+
+
+def parse_create_key_response(data: bytes) -> GroupKeyEnvelope:
+    # HRESULT GetKey(
+    #     [in] handle_t hBinding,
+    #     [in] ULONG cbTargetSD,
+    #     [in] [size_is(cbTargetSD)] [ref] char* pbTargetSD,
+    #     [in] [unique] GUID* pRootKeyID,
+    #     [in] LONG L0KeyID,
+    #     [in] LONG L1KeyID,
+    #     [in] LONG L2KeyID,
+    #     [out] unsigned long* pcbOut,
+    #     [out] [size_is(, *pcbOut)] byte** ppbOut);
+    view = memoryview(data)
+
+    hresult = struct.unpack("<I", view[-4:].tobytes())[0]
+    view = view[:-4]
+    if hresult != 0:
+        raise Exception(f"GetKey failed 0x{hresult:08X}")
+
+    key_length = struct.unpack("<I", view[:4])[0]
+    view = view[8:]  # Skip padding as well
+    # Skip the reference id and double up on pointer size
+    key = view[16 : 16 + key_length].tobytes()
+    assert len(key) == key_length
+
+    return GroupKeyEnvelope.unpack(key)
 
 
 def extract_enc_password_details(data: bytes) -> t.Tuple[str, uuid.UUID, int, int, int]:
@@ -539,11 +578,9 @@ def extract_enc_password_details(data: bytes) -> t.Tuple[str, uuid.UUID, int, in
 
 
 def main() -> None:
-    debugpy.listen(5678)
-    debugpy.wait_for_client()
-
     dc = "dc01.domain.test"
     server = "CN=SERVER2022,OU=Servers,DC=domain,DC=test"
+    sign_header = False
 
     enc_password = get_laps_enc_password(dc, server)
     target_sid, root_key_id, l0, l1, l2 = extract_enc_password_details(enc_password)
@@ -569,8 +606,15 @@ def main() -> None:
     out_token = ctx.step()
     assert out_token
 
+    # TODO: Use EPM to find the dynamic port for this service.
     with socket.create_connection((dc, 49672)) as s:
-        bind_data = create_bind(ISD_KEY, 1, 0, out_token)
+        bind_data = create_bind(
+            ISD_KEY,
+            1,
+            0,
+            out_token,
+            sign_header=sign_header,
+        )
 
         s.sendall(bind_data)
         resp = s.recv(4096)
@@ -580,7 +624,13 @@ def main() -> None:
         assert not ctx.complete
         assert out_token
 
-        alter_context = create_alter_context(ISD_KEY, 1, 0, out_token)
+        alter_context = create_alter_context(
+            ISD_KEY,
+            1,
+            0,
+            out_token,
+            sign_header=sign_header,
+        )
         s.sendall(alter_context)
         resp = s.recv(4096)
         in_token = parse_alter_context(resp)
@@ -588,13 +638,20 @@ def main() -> None:
         out_token = ctx.step(in_token)
         assert ctx.complete
         assert not out_token
+        # FUTURE: Deal with a no header signing.from server
 
         get_key_req = create_get_key_request(target_sid, root_key_id, l0, l1, l2)
-        request = create_request(0, get_key_req, ctx)
+        request = create_request(
+            0,
+            get_key_req,
+            ctx,
+            sign_header=sign_header,
+        )
         s.sendall(request)
         resp = s.recv(4096)
 
-        parse_response(resp)
+        create_key_resp = parse_response(resp, ctx, sign_header=sign_header)
+        key = parse_create_key_response(create_key_resp)
 
 
 if __name__ == "__main__":

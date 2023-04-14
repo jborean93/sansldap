@@ -386,3 +386,96 @@ class ManagedPasswordId:
             domain_name=domain,
             forest_name=forest,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class GroupKeyEnvelope:
+    # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf
+    # 2.2.4 Group Key Envelope
+    version: int
+    is_public_key: int
+    l0: int
+    l1: int
+    l2: int
+    root_key_identifier: uuid.UUID
+    kdf_algorithm: str
+    kdf_parameters: bytes
+    secret_algorithm: str
+    secret_parameters: bytes
+    private_key_length: int
+    public_key_length: int
+    domain_name: str
+    forest_name: str
+    l1_key: bytes
+    l2_key: bytes
+
+    @classmethod
+    def unpack(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> GroupKeyEnvelope:
+        view = memoryview(data)
+
+        version = struct.unpack("<I", view[:4])[0]
+
+        assert view[4:8].tobytes() == b"\x4B\x44\x53\x4B"
+
+        is_public_key = struct.unpack("<I", view[8:12])[0]
+        l0_index = struct.unpack("<I", view[12:16])[0]
+        l1_index = struct.unpack("<I", view[16:20])[0]
+        l2_index = struct.unpack("<I", view[20:24])[0]
+        root_key_identifier = uuid.UUID(bytes_le=view[24:40].tobytes())
+        kdf_algo_len = struct.unpack("<I", view[40:44])[0]
+        kdf_para_len = struct.unpack("<I", view[44:48])[0]
+        sec_algo_len = struct.unpack("<I", view[48:52])[0]
+        sec_para_len = struct.unpack("<I", view[52:56])[0]
+        priv_key_len = struct.unpack("<I", view[56:60])[0]
+        publ_key_len = struct.unpack("<I", view[60:64])[0]
+        l1_key_len = struct.unpack("<I", view[64:68])[0]
+        l2_key_len = struct.unpack("<I", view[68:72])[0]
+        domain_len = struct.unpack("<I", view[72:76])[0]
+        forest_len = struct.unpack("<I", view[76:80])[0]
+        view = view[80:]
+
+        kdf_algo = view[: kdf_algo_len - 2].tobytes().decode("utf-16-le")
+        view = view[kdf_algo_len:]
+
+        kdf_param = view[:kdf_para_len].tobytes()
+        view = view[kdf_para_len:]
+
+        secret_algo = view[: sec_algo_len - 2].tobytes().decode("utf-16-le")
+        view = view[sec_algo_len:]
+
+        secret_param = view[:sec_para_len].tobytes()
+        view = view[sec_para_len:]
+
+        domain = view[: domain_len - 2].tobytes().decode("utf-16-le")
+        view = view[domain_len:]
+
+        forest = view[: forest_len - 2].tobytes().decode("utf-16-le")
+        view = view[forest_len:]
+
+        l1_key = view[:l1_key_len].tobytes()
+        view = view[l1_key_len:]
+
+        l2_key = view[:l2_key_len].tobytes()
+        view = view[l2_key_len:]
+
+        return GroupKeyEnvelope(
+            version=version,
+            is_public_key=is_public_key,
+            l0=l0_index,
+            l1=l1_index,
+            l2=l2_index,
+            root_key_identifier=root_key_identifier,
+            kdf_algorithm=kdf_algo,
+            kdf_parameters=kdf_param,
+            secret_algorithm=secret_algo,
+            secret_parameters=secret_param,
+            private_key_length=priv_key_len,
+            public_key_length=publ_key_len,
+            domain_name=domain,
+            forest_name=forest,
+            l1_key=l1_key,
+            l2_key=l2_key,
+        )
