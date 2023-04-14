@@ -400,6 +400,22 @@ class ASN1Reader:
 
     read_sequence_of = read_sequence
 
+    def read_utf8_string(
+        self,
+        tag: t.Optional[ASN1Tag] = None,
+        header: t.Optional[ASN1Header] = None,
+        hint: t.Optional[str] = None,
+    ) -> str:
+        val, consumed = _read_asn1_utf8_string(
+            self._view,
+            tag=tag,
+            header=header,
+            hint=hint,
+        )
+        self._view = self._view[consumed:]
+
+        return val
+
 
 class ASN1Writer:
     """ASN.1 value writer.
@@ -949,6 +965,20 @@ def _read_asn1_set(
         tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.SET, True)
 
     return _validate_tag(data, tag, header=header, hint=hint)
+
+
+def _read_asn1_utf8_string(
+    data: t.Union[bytes, bytearray, memoryview],
+    tag: t.Optional[ASN1Tag] = None,
+    header: t.Optional[ASN1Header] = None,
+    hint: t.Optional[str] = None,
+) -> t.Tuple[str, int]:
+    """Unpacks an ASN.1 UTF8_STRING value."""
+    if not tag:
+        tag = header.tag if header else ASN1Tag.universal_tag(TypeTagNumber.UTF8_STRING, False)
+
+    raw_str, consumed = _validate_tag(data, tag, header=header, hint=hint)
+    return raw_str.tobytes().decode("utf-8"), consumed
 
 
 def _validate_tag(

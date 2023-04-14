@@ -1,10 +1,18 @@
 import base64
+import socket
 import sys
 import typing as t
 
 from ruamel import yaml
 
-from sansldap._pkcs7 import ContentInfo, EnvelopedData, KEKRecipientInfo, RecipientInfo, ManagedPasswordId
+from sansldap._pkcs7 import (
+    ContentInfo,
+    EnvelopedData,
+    KEKRecipientInfo,
+    ManagedPasswordId,
+    NCryptProtectionDescriptor,
+    RecipientInfo,
+)
 
 data = base64.b64decode(
     "MIIBZAYJKoZIhvcNAQcDoIIBVTCCAVECAQIxggEdooIBGQIBBDCB3ASBhAEAAABLRFNLAgAAAGkBAAAPAAAADgAAAKhPxrqQ6HyREJCD57D4WZYgAAAAGAAAABgAAABoD4CvgPwuwKPV3MBhp1Ny23XtDi/ChsKXOPzRmoOkHWQAbwBtAGEAaQBuAC4AdABlAHMAdAAAAGQAbwBtAGEAaQBuAC4AdABlAHMAdAAAADBTBgkrBgEEAYI3SgEwRgYKKwYBBAGCN0oBATA4MDYwNAwDU0lEDC1TLTEtNS0yMS00MTUxODA4Nzk3LTM0MzA1NjEwOTItMjg0MzQ2NDU4OC01MTIwCwYJYIZIAWUDBAEtBCgKJ5Img1sKLFLY7tKVtobKsV+Y8V/vfa2cMqGWwFBVaP6vCzUQNwXeMCsGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMTpn5UgmifKB/9LhQAgEQZt7BTBIkRTaH91BdNI7EO4eiLWpwDbXyGNM8OA6XlyYP1BQ4e/Do8eqEHofY6nKa1jeW+CvB96iBUGhk4Cz4BT9jw24wF4zEGE+BhdIvNqF+qWoXDo8Qj/nl8XjWuIIUazIqF4vdBZXEJoQ8zj9zEa9rya9VRGWzm9Y+m6/vD4ARegUSqGxQgwPlZosgx7szMl8="
@@ -60,19 +68,32 @@ if ci.content_type != EnvelopedData.content_type:
     raise ValueError("Unknown ContentInfo type")
 
 enveloped_data = EnvelopedData.unpack(ci.content)
-enc_ci = enveloped_data.encrypted_content_info
+assert len(enveloped_data.recipient_infos) == 1
+assert isinstance(enveloped_data.recipient_infos[0], KEKRecipientInfo)
+assert enveloped_data.recipient_infos[0].kekid.other is not None
+assert enveloped_data.recipient_infos[0].kekid.other.key_attr_id == "1.3.6.1.4.1.311.74.1"
+protection_descriptor = NCryptProtectionDescriptor.unpack(enveloped_data.recipient_infos[0].kekid.other.key_attr or b"")
+assert protection_descriptor.content_type == "1.3.6.1.4.1.311.74.1.1"
 
-info = {
-    "Recipients": [get_recipient_info(i) for i in enveloped_data.recipient_infos],
-    "EncryptedContentInfo": {
-        "ContentType": enc_ci.content_type,
-        "Algorithm": {
-            "Id": enc_ci.content_encryption_algorithm.algorithm,
-            "Parameters": base64.b16encode(enc_ci.content_encryption_algorithm.parameters or b"").decode(),
-        },
-    },
-}
+password_id = ManagedPasswordId.unpack(enveloped_data.recipient_infos[0].kekid.key_identifier)
 
-y = yaml.YAML()
-y.default_flow_style = False
-y.dump(info, sys.stdout)
+# b9785960-524f-11df-8b6d-83dcded72085
+with socket.create_connection(("dc01.domain.test", 135)) as s:
+    a = ""
+
+# enc_ci = enveloped_data.encrypted_content_info
+
+# info = {
+#     "Recipients": [get_recipient_info(i) for i in enveloped_data.recipient_infos],
+#     "EncryptedContentInfo": {
+#         "ContentType": enc_ci.content_type,
+#         "Algorithm": {
+#             "Id": enc_ci.content_encryption_algorithm.algorithm,
+#             "Parameters": base64.b16encode(enc_ci.content_encryption_algorithm.parameters or b"").decode(),
+#         },
+#     },
+# }
+
+# y = yaml.YAML()
+# y.default_flow_style = False
+# y.dump(info, sys.stdout)

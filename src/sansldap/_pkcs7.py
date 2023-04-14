@@ -8,7 +8,7 @@ import struct
 import typing as t
 import uuid
 
-from .asn1 import ASN1Header, ASN1Reader, ASN1Tag, ASN1Writer, TagClass, TypeTagNumber
+from .asn1 import ASN1Header, ASN1Reader, ASN1Tag, TagClass, TypeTagNumber
 
 
 @dataclasses.dataclass
@@ -303,6 +303,31 @@ class AlgorithmIdentifier:
 
 
 @dataclasses.dataclass
+class NCryptProtectionDescriptor:
+    content_type: str
+    type: str
+    value: str
+
+    @classmethod
+    def unpack(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> NCryptProtectionDescriptor:
+        reader = ASN1Reader(data).read_sequence()
+        content_type = reader.read_object_identifier()
+
+        reader = reader.read_sequence().read_sequence().read_sequence()
+        value_type = reader.read_utf8_string()
+        value = reader.read_utf8_string()
+
+        return NCryptProtectionDescriptor(
+            content_type=content_type,
+            type=value_type,
+            value=value,
+        )
+
+
+@dataclasses.dataclass
 class ManagedPasswordId:
     # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf
     # 2.2.4 Group Key Envelope
@@ -310,12 +335,12 @@ class ManagedPasswordId:
     # be missing a few fields. Anything beyond the root_key_identifier is guess
     # work based on the data seen.
     version: int
-    is_public_key: bool
-    l0_index: int
-    l1_index: int
-    l2_index: int
+    is_public_key: int
+    l0: int
+    l1: int
+    l2: int
     root_key_identifier: uuid.UUID
-    something: bytes
+    unknown: bytes
     domain_name: str
     forest_name: str
 
@@ -330,18 +355,18 @@ class ManagedPasswordId:
 
         assert view[4:8].tobytes() == b"\x4B\x44\x53\x4B"
 
-        is_public_key = struct.unpack("<I", view[8:12])[0] == 1
+        is_public_key = struct.unpack("<I", view[8:12])[0]
         l0_index = struct.unpack("<I", view[12:16])[0]
         l1_index = struct.unpack("<I", view[16:20])[0]
         l2_index = struct.unpack("<I", view[20:24])[0]
         root_key_identifier = uuid.UUID(bytes_le=view[24:40].tobytes())
-        something_length = struct.unpack("<I", view[40:44])[0]
+        unknown_length = struct.unpack("<I", view[40:44])[0]
         domain_len = struct.unpack("<I", view[44:48])[0]
         forest_len = struct.unpack("<I", view[48:52])[0]
         view = view[52:]
 
-        something = view[:something_length].tobytes()
-        view = view[something_length:]
+        unknown = view[:unknown_length].tobytes()
+        view = view[unknown_length:]
 
         # Take away 2 for the final null padding
         domain = view[: domain_len - 2].tobytes().decode("utf-16-le")
@@ -353,11 +378,11 @@ class ManagedPasswordId:
         return ManagedPasswordId(
             version=version,
             is_public_key=is_public_key,
-            l0_index=l0_index,
-            l1_index=l1_index,
-            l2_index=l2_index,
+            l0=l0_index,
+            l1=l1_index,
+            l2=l2_index,
             root_key_identifier=root_key_identifier,
-            something=something,
+            unknown=unknown,
             domain_name=domain,
             forest_name=forest,
         )
