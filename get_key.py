@@ -36,6 +36,44 @@ NDR64 = uuid.UUID("71710533-beba-4937-8319-b5dbef9ccc36")
 
 
 @dataclasses.dataclass(frozen=True)
+class EncryptedLAPSBlob:
+    update_timestamp: int  # FILETIME int64
+    flags: int
+    content_info: ContentInfo
+    encrypted_password: bytes
+
+    @classmethod
+    def unpack(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> EncryptedLAPSBlob:
+        view = memoryview(data)
+
+        timestamp_upper = struct.unpack("<I", view[:4])[0]
+        timestamp_lower = struct.unpack("<I", view[4:8])[0]
+        update_timestamp = (timestamp_upper << 32) | timestamp_lower
+        blob_len = struct.unpack("<I", view[8:12])[0]
+        flags = struct.unpack("<I", view[12:16])[0]
+        blob = view[16 : 16 + blob_len]
+        assert len(blob) == blob_len
+        assert len(view[16 + blob_len :]) == 0
+
+        # The blob contains a PKCS 7 ContentInfo value and the encrypted
+        # password blob straight after it. Peek at the header to get the length
+        # so we can get the encrypted password value.
+        header = ASN1Reader(blob).peek_header()
+        content_info = ContentInfo.unpack(blob[: header.tag_length + header.length], header=header)
+        enc_password = blob[header.tag_length + header.length :].tobytes()
+
+        return EncryptedLAPSBlob(
+            update_timestamp=update_timestamp,
+            flags=flags,
+            content_info=content_info,
+            encrypted_password=enc_password,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class SecTrailer:
     type: int
     level: int
@@ -193,7 +231,7 @@ class GroupKeyEnvelope:
 
 
 @dataclasses.dataclass(frozen=True)
-class ManagedPasswordId:
+class EncPasswordId:
     # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf
     # 2.2.4 Group Key Envelope
     # This struct seems similar (the magic matches) but the real data seems to
@@ -213,7 +251,7 @@ class ManagedPasswordId:
     def unpack(
         cls,
         data: t.Union[bytes, bytearray, memoryview],
-    ) -> ManagedPasswordId:
+    ) -> EncPasswordId:
         view = memoryview(data)
 
         version = struct.unpack("<I", view[:4])[0]
@@ -240,7 +278,7 @@ class ManagedPasswordId:
         forest = view[: forest_len - 2].tobytes().decode("utf-16-le")
         view = view[forest_len:]
 
-        return ManagedPasswordId(
+        return EncPasswordId(
             version=version,
             is_public_key=is_public_key,
             l0=l0_index,
@@ -762,32 +800,6 @@ def parse_create_key_response(data: bytes) -> GroupKeyEnvelope:
     return GroupKeyEnvelope.unpack(key)
 
 
-def extract_enc_password_details(
-    data: bytes,
-) -> t.Tuple[ManagedPasswordId, str, AlgorithmIdentifier, bytes, AlgorithmIdentifier]:
-    ci = ContentInfo.unpack(data[16:])
-    assert ci.content_type == EnvelopedData.content_type
-
-    enveloped_data = EnvelopedData.unpack(ci.content)
-    assert len(enveloped_data.recipient_infos) == 1
-    assert isinstance(enveloped_data.recipient_infos[0], KEKRecipientInfo)
-    assert enveloped_data.recipient_infos[0].kekid.other is not None
-    assert enveloped_data.recipient_infos[0].kekid.other.key_attr_id == "1.3.6.1.4.1.311.74.1"
-    protection_descriptor = NCryptProtectionDescriptor.unpack(
-        enveloped_data.recipient_infos[0].kekid.other.key_attr or b""
-    )
-    assert protection_descriptor.content_type == "1.3.6.1.4.1.311.74.1.1"
-    password_id = ManagedPasswordId.unpack(enveloped_data.recipient_infos[0].kekid.key_identifier)
-
-    return (
-        password_id,
-        protection_descriptor.value,
-        enveloped_data.recipient_infos[0].key_encryption_algorithm,
-        enveloped_data.recipient_infos[0].encrypted_key,
-        enveloped_data.encrypted_content_info.content_encryption_algorithm,
-    )
-
-
 def get_key(
     dc: str,
     target_sd: bytes,
@@ -885,7 +897,7 @@ def aes256gcm_decrypt(
 
 def generate_group_key(
     secret: bytes,
-    managed_info: ManagedPasswordId,
+    managed_info: EncPasswordId,
     rk: GroupKeyEnvelope,
 ) -> bytes:
     # MS-GKDI 3.1.4.1.2 Generating a Group Key
@@ -1015,7 +1027,25 @@ def main() -> None:
     sign_header = False
 
     enc_password = get_laps_enc_password(dc, server)
-    kek_id, target_sid, kek_algo, enc_key, content_algorithm = extract_enc_password_details(enc_password)
+    laps_blob = EncryptedLAPSBlob.unpack(enc_password)
+
+    assert laps_blob.content_info.content_type == EnvelopedData.content_type
+    enveloped_data = EnvelopedData.unpack(laps_blob.content_info.content)
+    assert enveloped_data.version == 2
+    assert len(enveloped_data.recipient_infos) == 1
+    assert isinstance(enveloped_data.recipient_infos[0], KEKRecipientInfo)
+    assert enveloped_data.recipient_infos[0].kekid.other is not None
+    assert enveloped_data.recipient_infos[0].kekid.other.key_attr_id == "1.3.6.1.4.1.311.74.1"
+    protection_descriptor = NCryptProtectionDescriptor.unpack(
+        enveloped_data.recipient_infos[0].kekid.other.key_attr or b""
+    )
+    assert protection_descriptor.content_type == "1.3.6.1.4.1.311.74.1.1"
+
+    target_sid = protection_descriptor.value
+    password_id = EncPasswordId.unpack(enveloped_data.recipient_infos[0].kekid.key_identifier)
+    kek_algo = enveloped_data.recipient_infos[0].key_encryption_algorithm
+    encrypted_cek = enveloped_data.recipient_infos[0].encrypted_key
+    content_algo = enveloped_data.encrypted_content_info.content_encryption_algorithm
 
     # Build the target security descriptor from the SID passed in. This SD
     # contains an ACE per target user with a mask of 0x3 and a final ACE of the
@@ -1031,10 +1061,10 @@ def main() -> None:
     group_key_info = get_key(
         dc,
         target_sd,
-        kek_id.root_key_identifier,
-        kek_id.l0,
-        kek_id.l1,
-        kek_id.l2,
+        password_id.root_key_identifier,
+        password_id.l0,
+        password_id.l1,
+        password_id.l2,
         sign_header=sign_header,
     )
 
@@ -1089,10 +1119,24 @@ def main() -> None:
     # Key wrap algorithm: RFC3394 (KEK -> CEK)
     # Decryption: AES-256-GCM (CEK, Blob)
 
+    # From MS there is this diagram
+    # https://learn.microsoft.com/en-us/windows/win32/seccng/protected-data-format
+    # Protected data is stored as an ASN.1 encoded BLOB. The data is formatted
+    # as CMS (certificate message syntax) enveloped content. The digital
+    # envelope contains encrypted content, recipient information that contains
+    # an encrypted content encryption key (CEK), and a header that contains
+    # information about the content, including the unencrypted protection
+    # descriptor rule string. This is shown by the following diagram.
+
     # This is not right and just me spitballing trying to figure things out.
-    kek = generate_group_key(target_sd, kek_id, group_key_info)
-    cek = keywrap.aes_key_unwrap(kek, enc_key)
-    password = aes256gcm_decrypt(content_algorithm, cek, enc_key)
+    kek = generate_group_key(target_sd, password_id, group_key_info)
+
+    # AES256-wrap
+    assert kek_algo.algorithm == "2.16.840.1.101.3.4.1.45"
+    assert not kek_algo.parameters
+    cek = keywrap.aes_key_unwrap(kek, encrypted_cek)
+
+    password = aes256gcm_decrypt(content_algo, cek, laps_blob.encrypted_password)
     print(password)
 
 

@@ -27,8 +27,9 @@ class ContentInfo:
     def unpack(
         cls,
         data: t.Union[bytes, bytearray, memoryview],
+        header: t.Optional[ASN1Header] = None,
     ) -> ContentInfo:
-        reader = ASN1Reader(data).read_sequence()
+        reader = ASN1Reader(data).read_sequence(header=header)
         content_type = reader.read_object_identifier(
             hint="ContentInfo.contentType",
         )
