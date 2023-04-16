@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+import math
 import re
 import socket
 import struct
@@ -25,8 +26,14 @@ from sansldap._pkcs7 import (
 
 from cryptography.hazmat.primitives import hashes, keywrap
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.serialization import load_der_private_key
+from cryptography.hazmat.primitives.serialization import (
+    load_der_private_key,
+    Encoding,
+    PrivateFormat,
+    NoEncryption,
+)
 from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
 from cryptography.hazmat.primitives.kdf.kbkdf import CounterLocation, KBKDFHMAC, Mode
 
 
@@ -60,7 +67,7 @@ class EncryptedLAPSBlob:
 
         # The blob contains a PKCS 7 ContentInfo value and the encrypted
         # password blob straight after it. Peek at the header to get the length
-        # so we can get the encrypted password value.
+        # so we can get the encrypted password value after it.
         header = ASN1Reader(blob).peek_header()
         content_info = ContentInfo.unpack(blob[: header.tag_length + header.length], header=header)
         enc_password = blob[header.tag_length + header.length :].tobytes()
@@ -895,92 +902,6 @@ def aes256gcm_decrypt(
     return decryptor.update(secret) + decryptor.finalize()
 
 
-def generate_group_key(
-    secret: bytes,
-    managed_info: EncPasswordId,
-    rk: GroupKeyEnvelope,
-) -> bytes:
-    # MS-GKDI 3.1.4.1.2 Generating a Group Key
-    # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf#%5B%7B%22num%22%3A91%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C69%2C557%2C0%5D
-    assert rk.version == 1
-    assert rk.kdf_algorithm == "SP800_108_CTR_HMAC"
-
-    kdf_parameters = KDFParameters.unpack(rk.kdf_parameters)
-    hash_algo: hashes.HashAlgorithm
-    if kdf_parameters.hash_name == "SHA1":
-        hash_algo = hashes.SHA1()
-    elif kdf_parameters.hash_name == "SHA256":
-        hash_algo = hashes.SHA256()
-    elif kdf_parameters.hash_name == "SHA384":
-        hash_algo = hashes.SHA384()
-    elif kdf_parameters.hash_name == "SHA512":
-        hash_algo = hashes.SHA512()
-    else:
-        raise Exception(f"Unsupported hash algorithm {kdf_parameters.hash_name}")
-
-    if rk.secret_algorithm == "DH":
-        dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
-        assert dh_parameters.key_length == (rk.public_key_length // 8)
-    elif rk.secret_algorithm in ["ECDH_P256", "ECDH_P384", "ECDH_P521"]:
-        assert not rk.secret_parameters
-    else:
-        raise Exception(f"Unsupported secret agreement algorithm {rk.secret_algorithm}")
-
-    l1_key = rk.l1_key
-    if rk.l1 > managed_info.l1:
-        l1_key = compute_key(
-            hash_algo,
-            64,
-            compute_kdf_context(rk.root_key_identifier, rk.l0, rk.l1, 0xFFFFFFFF),
-            rk.l1_key,
-        )
-
-    l2_key = rk.l2_key
-    if rk.l2 > managed_info.l2:
-        l2_key = compute_key(
-            hash_algo,
-            64,
-            compute_kdf_context(rk.root_key_identifier, rk.l0, rk.l1, rk.l2),
-            l1_key,
-        )
-
-    return compute_key(hash_algo, 32, secret, l2_key)
-
-    # For deriving the private key?
-    # k1 = rk.l2_key
-    # context = (rk.secret_algorithm + "\0").encode("utf-16-le")
-    # l = rk.private_key_length
-    # l_padding = -l % 8
-    # if l_padding:
-    #     l += l_padding
-
-    # kdf = KBKDFHMAC(
-    #     algorithm=hash_algo,
-    #     mode=Mode.CounterMode,
-    #     length=l // 8,
-    #     label=label,
-    #     context=context,
-    #     # I'm just guessing at these options
-    #     rlen=4,
-    #     llen=4,
-    #     location=CounterLocation.BeforeFixed,
-    #     fixed=None,
-    # )
-    # priv_key = kdf.derive(k1)
-
-    # if rk.secret_algorithm == "DH":
-    #     p = int.from_bytes(dh_parameters.field_order, byteorder="big")
-    #     g = int.from_bytes(dh_parameters.generator, byteorder="big")
-    #     dh_params = dh.DHParameterNumbers(p, g, q=None).parameters()
-    #     # crypto_priv_key = load_der_private_key(priv_key, None)
-    #     a = ""
-
-    # else:
-    #     raise NotImplementedError("")
-
-    # return priv_key
-
-
 def compute_kdf_context(
     key_guid: uuid.UUID,
     l0: int,
@@ -989,7 +910,7 @@ def compute_kdf_context(
 ) -> bytes:
     # The MS-GKDI docs state this is just 'Key(SD, RK, L0, L1, L2)' but don't
     # mention how they are all joined together. GoldenGMSA only uses
-    # (RK, L0, L1, K2) concatented together. Probably needs more investigation.
+    # (RK, L0, L1, K2) concatenated together. Probably needs more investigation.
     context = key_guid.bytes_le
     context += struct.pack("<I", l0)
     context += struct.pack("<I", l1)
@@ -998,14 +919,18 @@ def compute_kdf_context(
     return context
 
 
-def compute_key(
+def kdf(
     algorithm: hashes.HashAlgorithm,
-    length: int,
-    context: bytes,
     secret: bytes,
+    label: bytes,
+    context: bytes,
+    length: int,
+    *,
+    rlen: int = 4,
+    llen: int = 4,
 ) -> bytes:
-    label = "KDS service\0".encode("utf-16-le")
-
+    # KDF(HashAlg, KI, Label, Context, L)
+    # where KDF is SP800-108 in counter mode.
     kdf = KBKDFHMAC(
         algorithm=algorithm,
         mode=Mode.CounterMode,
@@ -1013,8 +938,8 @@ def compute_key(
         label=label,
         context=context,
         # I'm just guessing at these options
-        rlen=4,
-        llen=4,
+        rlen=rlen,
+        llen=llen,
         location=CounterLocation.BeforeFixed,
         fixed=None,
     )
@@ -1058,7 +983,7 @@ def main() -> None:
         dacl=[ace_to_bytes(target_sid, 3), ace_to_bytes("S-1-1-0", 2)],
     )
 
-    group_key_info = get_key(
+    rk = get_key(
         dc,
         target_sd,
         password_id.root_key_identifier,
@@ -1126,13 +1051,88 @@ def main() -> None:
     # envelope contains encrypted content, recipient information that contains
     # an encrypted content encryption key (CEK), and a header that contains
     # information about the content, including the unencrypted protection
-    # descriptor rule string. This is shown by the following diagram.
+    # descriptor rule string.
 
     # This is not right and just me spitballing trying to figure things out.
-    kek = generate_group_key(target_sd, password_id, group_key_info)
+    # MS-GKDI 3.1.4.1.2 Generating a Group Key
+    # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf#%5B%7B%22num%22%3A91%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C69%2C557%2C0%5D
+    print(f"PasswordId L0 {password_id.l0} L1 {password_id.l1} L2 {password_id.l2}")
+    print(f"GroupKeyId L0 {rk.l0} L1 {rk.l1} L2 {rk.l2}")
+    label = "KDS service\0".encode("utf-16-le")
 
-    # AES256-wrap
-    assert kek_algo.algorithm == "2.16.840.1.101.3.4.1.45"
+    assert rk.version == 1
+    assert rk.kdf_algorithm == "SP800_108_CTR_HMAC"
+
+    kdf_parameters = KDFParameters.unpack(rk.kdf_parameters)
+    hash_algo: hashes.HashAlgorithm
+    if kdf_parameters.hash_name == "SHA1":
+        hash_algo = hashes.SHA1()
+    elif kdf_parameters.hash_name == "SHA256":
+        hash_algo = hashes.SHA256()
+    elif kdf_parameters.hash_name == "SHA384":
+        hash_algo = hashes.SHA384()
+    elif kdf_parameters.hash_name == "SHA512":
+        hash_algo = hashes.SHA512()
+    else:
+        raise Exception(f"Unsupported hash algorithm {kdf_parameters.hash_name}")
+
+    # TODO: Deal with L1 differences.
+    l2_key = rk.l2_key
+    l2 = rk.l2
+    while l2 != password_id.l2:
+        l2 -= 1
+
+        # Key(SD, RK, L0, L1, n) = KDF(
+        #   HashAlg,
+        #   Key(SD, RK, L0, L1, n+1),
+        #   "KDS service",
+        #   RKID || L0 ||L1|| n,
+        #   512
+        # )
+        l2_key = kdf(
+            hash_algo,
+            l2_key,
+            label,
+            compute_kdf_context(
+                rk.root_key_identifier,
+                rk.l0,
+                rk.l1,
+                l2,
+            ),
+            64,
+        )
+
+    # PrivKey(SD, RK, L0, L1, L2) = KDF(
+    #   HashAlg,
+    #   Key(SD, RK, L0, L1, L2),
+    #   "KDS service",
+    #   RK.msKds-SecretAgreement-AlgorithmID,
+    #   RK.msKds-PrivateKey-Length
+    # )
+    private_key = kdf(
+        hash_algo,
+        l2_key,
+        label,
+        (rk.secret_algorithm + "\0").encode("utf-16-le"),
+        math.ceil(rk.private_key_length / 8),
+    )
+    private_int = int.from_bytes(private_key, byteorder="big")
+
+    # TODO: Support ECDH keys
+    assert rk.secret_algorithm == "DH"
+    dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
+    assert dh_parameters.key_length == (rk.public_key_length // 8)
+
+    p = int.from_bytes(dh_parameters.generator, byteorder="big")
+    g = int.from_bytes(dh_parameters.field_order, byteorder="big")
+    pub_key = pow(p, private_int, g)
+
+    shared_key = pow(pub_key, private_int, p)
+    b_shared_key = shared_key.to_bytes((shared_key.bit_length() + 7) // 8, "big")
+
+    kek = ConcatKDFHash(hash_algo, 32, otherinfo=None).derive(b_shared_key)
+
+    assert kek_algo.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
     assert not kek_algo.parameters
     cek = keywrap.aes_key_unwrap(kek, encrypted_cek)
 
