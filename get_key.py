@@ -13,9 +13,19 @@ import uuid
 import gssapi
 import gssapi.raw
 import spnego
+from cryptography.hazmat.primitives import hashes, keywrap
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
+from cryptography.hazmat.primitives.kdf.kbkdf import KBKDFHMAC, CounterLocation, Mode
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    load_der_private_key,
+)
 
 import sansldap
-from sansldap.asn1 import ASN1Reader
 from sansldap._pkcs7 import (
     AlgorithmIdentifier,
     ContentInfo,
@@ -23,23 +33,13 @@ from sansldap._pkcs7 import (
     KEKRecipientInfo,
     NCryptProtectionDescriptor,
 )
+from sansldap.asn1 import ASN1Reader
 
-from cryptography.hazmat.primitives import hashes, keywrap
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.serialization import (
-    load_der_private_key,
-    Encoding,
-    PrivateFormat,
-    NoEncryption,
-)
-from cryptography.hazmat.primitives.asymmetric import dh
-from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
-from cryptography.hazmat.primitives.kdf.kbkdf import CounterLocation, KBKDFHMAC, Mode
-
-
-ISD_KEY = uuid.UUID("b9785960-524f-11df-8b6d-83dcded72085")
-NDR = uuid.UUID("8a885d04-1ceb-11c9-9fe8-08002b104860")
-NDR64 = uuid.UUID("71710533-beba-4937-8319-b5dbef9ccc36")
+BIND_TIME_FEATURE_NEGOTIATION = (uuid.UUID("6cb71c2c-9812-4540-0300-000000000000"), 1, 0)
+EMP = (uuid.UUID("e1af8308-5d1f-11c9-91a4-08002b14a0fa"), 3, 0)
+ISD_KEY = (uuid.UUID("b9785960-524f-11df-8b6d-83dcded72085"), 1, 0)
+NDR = (uuid.UUID("8a885d04-1ceb-11c9-9fe8-08002b104860"), 2, 0)
+NDR64 = (uuid.UUID("71710533-beba-4937-8319-b5dbef9ccc36"), 1, 0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +87,15 @@ class SecTrailer:
     pad_length: int
     context_id: int
     data: bytes
+
+
+@dataclasses.dataclass(frozen=True)
+class Tower:
+    service: t.Tuple[uuid.UUID, int, int]
+    data_rep: t.Tuple[uuid.UUID, int, int]
+    protocol: int
+    port: int
+    addr: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -250,7 +259,7 @@ class EncPasswordId:
     l1: int
     l2: int
     root_key_identifier: uuid.UUID
-    public_key: bytes
+    unknown: bytes
     domain_name: str
     forest_name: str
 
@@ -270,13 +279,13 @@ class EncPasswordId:
         l1_index = struct.unpack("<I", view[16:20])[0]
         l2_index = struct.unpack("<I", view[20:24])[0]
         root_key_identifier = uuid.UUID(bytes_le=view[24:40].tobytes())
-        pub_key_len = struct.unpack("<I", view[40:44])[0]
+        unknown_len = struct.unpack("<I", view[40:44])[0]
         domain_len = struct.unpack("<I", view[44:48])[0]
         forest_len = struct.unpack("<I", view[48:52])[0]
         view = view[52:]
 
-        public_key = view[:pub_key_len].tobytes()
-        view = view[pub_key_len:]
+        unknown = view[:unknown_len].tobytes()
+        view = view[unknown_len:]
 
         # Take away 2 for the final null padding
         domain = view[: domain_len - 2].tobytes().decode("utf-16-le")
@@ -292,7 +301,7 @@ class EncPasswordId:
             l1=l1_index,
             l2=l2_index,
             root_key_identifier=root_key_identifier,
-            public_key=public_key,
+            unknown=unknown,
             domain_name=domain,
             forest_name=forest,
         )
@@ -462,66 +471,58 @@ def create_pdu(
 
 
 def create_bind(
-    service_id: uuid.UUID,
-    version_major: int,
-    version_minor: int,
-    token: bytes,
+    service: t.Tuple[uuid.UUID, int, int],
+    syntaxes: t.List[bytes],
+    auth_data: t.Optional[bytes] = None,
     sign_header: bool = False,
 ) -> bytes:
-    bind_negotiation = uuid.UUID("6cb71c2c-9812-4540-0300-000000000000")
-
-    ctx1 = b"\x00\x00\x01\x00"
-    ctx1 += service_id.bytes_le
-    ctx1 += struct.pack("<H", version_major)
-    ctx1 += struct.pack("<H", version_minor)
-    ctx1 += NDR.bytes_le + b"\x02\x00\x00\x00"
-
-    ctx2 = b"\x01\x00\x01\x00"
-    ctx2 += service_id.bytes_le
-    ctx2 += struct.pack("<H", version_major)
-    ctx2 += struct.pack("<H", version_minor)
-    ctx2 += NDR64.bytes_le + b"\x01\x00\x00\x00"
-
-    ctx3 = b"\x02\x00\x01\x00"
-    ctx3 += service_id.bytes_le + b"\x01\x00\x00\x00"
-    ctx3 += bind_negotiation.bytes_le + b"\x01\x00\x00\x00"
+    context_header = b"\x00\x00\x01\x00"
+    context_header += service[0].bytes_le
+    context_header += struct.pack("<H", service[1])
+    context_header += struct.pack("<H", service[2])
+    context_data = bytearray()
+    for idx, s in enumerate(syntaxes):
+        offset = len(context_data)
+        context_data += context_header
+        memoryview(context_data)[offset : offset + 2] = struct.pack("<H", idx)
+        context_data += s
 
     bind_data = bytearray()
     bind_data += b"\xd0\x16"  # Max Xmit Frag
     bind_data += b"\xd0\x16"  # Max Recv Frag
     bind_data += b"\x00\x00\x00\x00"  # Assoc Group
     bind_data += b"\x03\x00\x00\x00"  # Num context items
-    bind_data += ctx1 + ctx2 + ctx3
+    bind_data += context_data
 
-    auth_data = SecTrailer(
-        type=9,  # SPNEGO
-        level=6,  # Packet Privacy
-        pad_length=0,
-        context_id=0,
-        data=token,
-    )
+    sec_trailer: t.Optional[SecTrailer] = None
+    if auth_data:
+        sec_trailer = SecTrailer(
+            type=9,  # SPNEGO
+            level=6,  # Packet Privacy
+            pad_length=0,
+            context_id=0,
+            data=auth_data,
+        )
 
     return create_pdu(
         packet_type=11,
         packet_flags=0x03 | (0x4 if sign_header else 0x0),
         call_id=1,
         header_data=bytes(bind_data),
-        sec_trailer=auth_data,
+        sec_trailer=sec_trailer,
     )
 
 
 def create_alter_context(
-    service_id: uuid.UUID,
-    version_major: int,
-    version_minor: int,
+    service: t.Tuple[uuid.UUID, int, int],
     token: bytes,
     sign_header: bool = False,
 ) -> bytes:
     ctx1 = b"\x01\x00\x01\x00"
-    ctx1 += service_id.bytes_le
-    ctx1 += struct.pack("<H", version_major)
-    ctx1 += struct.pack("<H", version_minor)
-    ctx1 += NDR64.bytes_le + b"\x01\x00\x00\x00"
+    ctx1 += service[0].bytes_le
+    ctx1 += struct.pack("<H", service[1])
+    ctx1 += struct.pack("<H", service[1])
+    ctx1 += NDR64[0].bytes_le + struct.pack("<H", NDR64[1]) + struct.pack("<H", NDR[2])
 
     alter_context_data = bytearray()
     alter_context_data += b"\xd0\x16"  # Max Xmit Frag
@@ -550,40 +551,45 @@ def create_alter_context(
 def create_request(
     opnum: int,
     data: bytes,
-    ctx: gssapi.SecurityContext,
+    ctx: t.Optional[gssapi.SecurityContext] = None,
     sign_header: bool = False,
 ) -> bytes:
     # Add Verification trailer to data
     # MS-RPCE 2.2.2.13 Veritifcation Trailer
     # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rpce/0e9fea61-1bff-4478-9bfe-a3b6d8b64ac3
-    pcontext = bytearray()
-    pcontext += ISD_KEY.bytes_le
-    pcontext += struct.pack("<I", 1)  # ISD_KEY version
-    pcontext += NDR64.bytes_le
-    pcontext += struct.pack("<I", 1)
+    if ctx:
+        pcontext = bytearray()
+        pcontext += ISD_KEY[0].bytes_le
+        pcontext += struct.pack("<H", ISD_KEY[1]) + struct.pack("<H", ISD_KEY[2])
+        pcontext += NDR64[0].bytes_le
+        pcontext += struct.pack("<H", NDR64[1]) + struct.pack("<H", NDR64[2])
 
-    verification_trailer = bytearray()
-    verification_trailer += b"\x8a\xe3\x13\x71\x02\xf4\x36\x71"  # Signature
+        verification_trailer = bytearray()
+        verification_trailer += b"\x8a\xe3\x13\x71\x02\xf4\x36\x71"  # Signature
 
-    verification_trailer += b"\x02\x40"  # Trailer Command - PCONTEXT + End
-    verification_trailer += struct.pack("<H", len(pcontext))
-    verification_trailer += pcontext
+        verification_trailer += b"\x02\x40"  # Trailer Command - PCONTEXT + End
+        verification_trailer += struct.pack("<H", len(pcontext))
+        verification_trailer += pcontext
 
-    # Verification trailer to added to a 4 byte boundary on the stub data
-    data_padding = -len(data) % 4
-    data += b"\x00" * data_padding
+        # Verification trailer to added to a 4 byte boundary on the stub data
+        data_padding = -len(data) % 4
+        data += b"\x00" * data_padding
 
-    data += verification_trailer
-    alloc_hint = len(data)
-    auth_padding = -len(data) % 16
-    data += b"\x00" * auth_padding
+        data += verification_trailer
+        alloc_hint = len(data)
+        auth_padding = -len(data) % 16
+        data += b"\x00" * auth_padding
+
+    else:
+        alloc_hint = len(data)
 
     request_data = bytearray()
     request_data += struct.pack("<I", alloc_hint)
     request_data += struct.pack("<H", 1)  # Context id
     request_data += struct.pack("<H", opnum)
 
-    if sign_header:
+    sec_trailer: t.Optional[SecTrailer] = None
+    if ctx and sign_header:
         raise NotImplementedError()
 
         # I have no idea what is actually signed. I'm guessing it's the PDU header
@@ -620,7 +626,7 @@ def create_request(
         #     sec_trailer=sec_trailer,
         # )
 
-    else:
+    elif ctx:
         iov_buffers = gssapi.raw.IOV(
             gssapi.raw.IOVBufferType.header,
             data,
@@ -640,15 +646,109 @@ def create_request(
             context_id=0,
             data=iov_buffers[0].value or b"",
         )
+        stub_data = iov_buffers[1].value
 
-        return create_pdu(
-            packet_type=0,
-            packet_flags=0x03,
-            call_id=1,
-            header_data=bytes(request_data),
-            stub_data=iov_buffers[1].value,
-            sec_trailer=sec_trailer,
+    else:
+        stub_data = data
+
+    return create_pdu(
+        packet_type=0,
+        packet_flags=0x03,
+        call_id=1,
+        header_data=bytes(request_data),
+        stub_data=stub_data,
+        sec_trailer=sec_trailer,
+    )
+
+
+def get_fault_pdu_error(data: memoryview) -> int:
+    status = struct.unpack("<I", data[24:28])[0]
+
+    return status
+
+
+def parse_bind_ack(data: bytes) -> t.Optional[bytes]:
+    view = memoryview(data)
+
+    pkt_type = struct.unpack("B", view[2:3])[0]
+    if pkt_type == 3:
+        err = get_fault_pdu_error(view)
+        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
+
+    assert pkt_type == 12
+
+    auth_length = struct.unpack("<H", view[10:12])[0]
+    if auth_length:
+        auth_blob = view[-auth_length:].tobytes()
+
+        return auth_blob
+
+    else:
+        return None
+
+
+def parse_alter_context(data: bytes) -> bytes:
+    view = memoryview(data)
+
+    pkt_type = struct.unpack("B", view[2:3])[0]
+    if pkt_type == 3:
+        err = get_fault_pdu_error(view)
+        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
+
+    assert pkt_type == 15
+
+    auth_length = struct.unpack("<H", view[10:12])[0]
+    auth_blob = view[-auth_length:].tobytes()
+
+    return auth_blob
+
+
+def parse_response(
+    data: bytes,
+    ctx: t.Optional[gssapi.SecurityContext] = None,
+    sign_header: bool = False,
+) -> bytes:
+    view = memoryview(data)
+
+    pkt_type = struct.unpack("B", view[2:3])[0]
+    if pkt_type == 3:  # False
+        err = get_fault_pdu_error(view)
+        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
+
+    assert pkt_type == 2
+    frag_length = struct.unpack("<H", view[8:10])[0]
+    auth_length = struct.unpack("<H", view[10:12])[0]
+
+    assert len(view) == frag_length
+    if auth_length:
+        auth_data = view[-(auth_length + 8) :]
+        stub_data = view[24 : len(view) - (auth_length + 8)]
+        padding = struct.unpack("B", auth_data[2:3])[0]
+
+    else:
+        auth_data = memoryview(b"")
+        stub_data = view[24:]
+        padding = 0
+
+    if ctx and sign_header:
+        raise NotImplementedError()
+
+    elif ctx:
+        iov_buffers = gssapi.raw.IOV(
+            (gssapi.raw.IOVBufferType.header, False, auth_data[8:].tobytes()),
+            stub_data.tobytes(),
+            std_layout=False,
         )
+        gssapi.raw.unwrap_iov(
+            ctx,
+            message=iov_buffers,
+        )
+
+        decrypted_stub = iov_buffers[1].value or b""
+        return decrypted_stub[: len(decrypted_stub) - padding]
+
+    else:
+        return stub_data.tobytes()
 
 
 def create_get_key_request(
@@ -657,7 +757,7 @@ def create_get_key_request(
     l0: int,
     l1: int,
     l2: int,
-) -> bytes:
+) -> t.Tuple[int, bytes]:
     # HRESULT GetKey(
     #     [in] handle_t hBinding,
     #     [in] ULONG cbTargetSD,
@@ -699,85 +799,7 @@ def create_get_key_request(
     # L2KeyID
     data += struct.pack("<I", l2)
 
-    return bytes(data)
-
-
-def get_fault_pdu_error(data: memoryview) -> int:
-    status = struct.unpack("<I", data[24:28])[0]
-
-    return status
-
-
-def parse_bind_ack(data: bytes) -> bytes:
-    view = memoryview(data)
-
-    pkt_type = struct.unpack("B", view[2:3])[0]
-    if pkt_type == 3:
-        err = get_fault_pdu_error(view)
-        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
-
-    assert pkt_type == 12
-
-    auth_length = struct.unpack("<H", view[10:12])[0]
-    auth_blob = view[-auth_length:].tobytes()
-
-    return auth_blob
-
-
-def parse_alter_context(data: bytes) -> bytes:
-    view = memoryview(data)
-
-    pkt_type = struct.unpack("B", view[2:3])[0]
-    if pkt_type == 3:
-        err = get_fault_pdu_error(view)
-        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
-
-    assert pkt_type == 15
-
-    auth_length = struct.unpack("<H", view[10:12])[0]
-    auth_blob = view[-auth_length:].tobytes()
-
-    return auth_blob
-
-
-def parse_response(
-    data: bytes,
-    ctx: gssapi.SecurityContext,
-    sign_header: bool = False,
-) -> bytes:
-    view = memoryview(data)
-
-    pkt_type = struct.unpack("B", view[2:3])[0]
-    if pkt_type == 3:  # False
-        err = get_fault_pdu_error(view)
-        raise Exception(f"Receive Fault PDU: 0x{err:08X}")
-
-    assert pkt_type == 2
-    frag_length = struct.unpack("<H", view[8:10])[0]
-    auth_length = struct.unpack("<H", view[10:12])[0]
-
-    assert len(view) == frag_length
-    auth_data = view[-(auth_length + 8) :]
-    stub_data = view[24 : len(view) - (auth_length + 8)]
-
-    padding = struct.unpack("B", auth_data[2:3])[0]
-
-    if sign_header:
-        raise NotImplementedError()
-
-    else:
-        iov_buffers = gssapi.raw.IOV(
-            (gssapi.raw.IOVBufferType.header, False, auth_data[8:].tobytes()),
-            stub_data.tobytes(),
-            std_layout=False,
-        )
-        gssapi.raw.unwrap_iov(
-            ctx,
-            message=iov_buffers,
-        )
-
-        decrypted_stub = iov_buffers[1].value or b""
-        return decrypted_stub[: len(decrypted_stub) - padding]
+    return 0, bytes(data)
 
 
 def parse_create_key_response(data: bytes) -> GroupKeyEnvelope:
@@ -807,6 +829,150 @@ def parse_create_key_response(data: bytes) -> GroupKeyEnvelope:
     return GroupKeyEnvelope.unpack(key)
 
 
+def create_ept_map_request(
+    service: t.Tuple[uuid.UUID, int, int],
+    data_rep: t.Tuple[uuid.UUID, int, int],
+    protocol: int = 0x0B,  # TCP/IP
+    port: int = 135,
+    address: int = 0,
+) -> t.Tuple[int, bytes]:
+    # MS-RPCE 2.2.1.2.5 ept_map Method
+    # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rpce/ab744583-430e-4055-8901-3c6bc007e791
+    # void ept_map(
+    #     [in] handle_t hEpMapper,
+    #     [in, ptr] UUID* obj,
+    #     [in, ptr] twr_p_t map_tower,
+    #     [in, out] ept_lookup_handle_t* entry_handle,
+    #     [in, range(0,500)] unsigned long max_towers,
+    #     [out] unsigned long* num_towers,
+    #     [out, ptr, size_is(max_towers), length_is(*num_towers)]
+    #         twr_p_t* ITowers,
+    #     [out] error_status* status
+    # );
+    def build_floor(protocol: int, lhs: bytes, rhs: bytes) -> bytes:
+        data = bytearray()
+        data += struct.pack("<H", len(lhs) + 1)
+        data += struct.pack("B", protocol)
+        data += lhs
+        data += struct.pack("<H", len(rhs))
+        data += rhs
+
+        return bytes(data)
+
+    floors: t.List[bytes] = [
+        build_floor(
+            protocol=0x0D,
+            lhs=service[0].bytes_le + struct.pack("<H", service[1]),
+            rhs=struct.pack("<H", service[2]),
+        ),
+        build_floor(
+            protocol=0x0D,
+            lhs=data_rep[0].bytes_le + struct.pack("<H", data_rep[1]),
+            rhs=struct.pack("<H", data_rep[2]),
+        ),
+        build_floor(protocol=protocol, lhs=b"", rhs=b"\x00\x00"),
+        build_floor(protocol=0x07, lhs=b"", rhs=struct.pack(">H", port)),
+        build_floor(protocol=0x09, lhs=b"", rhs=struct.pack(">I", address)),
+    ]
+
+    tower = bytearray()
+    tower += struct.pack("<H", len(floors))
+    for f in floors:
+        tower += f
+    tower_padding = -(len(tower) + 4) % 8
+
+    data = bytearray()
+    data += b"\x01" + (b"\x00" * 23)  # Blank UUID pointer with referent id 1
+    data += b"\x02\x00\x00\x00\x00\x00\x00\x00"  # Tower referent id 2
+    data += struct.pack("<Q", len(tower))
+    data += struct.pack("<I", len(tower))
+    data += tower
+    data += b"\x00" * tower_padding
+    data += b"\x00" * 20  # Context handle
+    data += struct.pack("<I", 4)  # Max towers
+
+    return 3, bytes(data)
+
+
+def parse_ept_map_response(data: bytes) -> t.List[Tower]:
+    def unpack_floor(view: memoryview) -> t.Tuple[int, int, memoryview, memoryview]:
+        lhs_len = struct.unpack("<H", view[:2])[0]
+        proto = view[2]
+        lhs = view[3 : lhs_len + 2]
+        offset = lhs_len + 2
+
+        rhs_len = struct.unpack("<H", view[offset : offset + 2])[0]
+        rhs = view[offset + 2 : offset + rhs_len + 2]
+
+        return offset + rhs_len + 2, proto, lhs, rhs
+
+    view = memoryview(data)
+
+    return_code = struct.unpack("<I", view[-4:])[0]
+    assert return_code == 0
+    num_towers = struct.unpack("<I", view[20:24])[0]
+    # tower_max_count = struct.unpack("<Q", view[24:32])[0]
+    # tower_offset = struct.unpack("<Q", view[32:40])[0]
+    tower_count = struct.unpack("<Q", view[40:48])[0]
+
+    tower_data_offset = 8 * tower_count  # Ignore referent ids
+    view = view[48 + tower_data_offset :]
+    towers: t.List[Tower] = []
+    for _ in range(tower_count):
+        tower_length = struct.unpack("<Q", view[:8])[0]
+        padding = -(tower_length + 4) % 8
+        floor_len = struct.unpack("<H", view[12:14])[0]
+        assert floor_len == 5
+        view = view[14:]
+
+        offset, proto, lhs, rhs = unpack_floor(view)
+        view = view[offset:]
+        assert proto == 0x0D
+        service = (
+            uuid.UUID(bytes_le=lhs[:16].tobytes()),
+            struct.unpack("<H", lhs[16:])[0],
+            struct.unpack("<H", rhs)[0],
+        )
+
+        offset, proto, lhs, rhs = unpack_floor(view)
+        view = view[offset:]
+        assert proto == 0x0D
+        data_rep = (
+            uuid.UUID(bytes_le=lhs[:16].tobytes()),
+            struct.unpack("<H", lhs[16:])[0],
+            struct.unpack("<H", rhs)[0],
+        )
+
+        offset, protocol, _, _ = unpack_floor(view)
+        view = view[offset:]
+        assert protocol == 0x0B
+
+        offset, proto, lhs, rhs = unpack_floor(view)
+        view = view[offset:]
+        assert proto == 0x07
+        port = struct.unpack(">H", rhs)[0]
+
+        offset, proto, lhs, rhs = unpack_floor(view)
+        view = view[offset:]
+        assert proto == 0x09
+        addr = struct.unpack(">I", rhs)[0]
+
+        towers.append(
+            Tower(
+                service=service,
+                data_rep=data_rep,
+                protocol=protocol,
+                port=port,
+                addr=addr,
+            )
+        )
+        view = view[padding:]
+
+    assert len(towers) == num_towers
+
+    return towers
+
+
 def get_key(
     dc: str,
     target_sd: bytes,
@@ -816,6 +982,38 @@ def get_key(
     l2: int,
     sign_header: bool = True,
 ) -> GroupKeyEnvelope:
+    bind_syntaxes = [
+        NDR[0].bytes_le + struct.pack("<H", NDR[1]) + struct.pack("<H", NDR[2]),
+        NDR64[0].bytes_le + struct.pack("<H", NDR64[1]) + struct.pack("<H", NDR64[2]),
+        BIND_TIME_FEATURE_NEGOTIATION[0].bytes_le
+        + struct.pack("<H", BIND_TIME_FEATURE_NEGOTIATION[1])
+        + struct.pack("<H", BIND_TIME_FEATURE_NEGOTIATION[2]),
+    ]
+
+    # Find the dynamic endpoint port for the ISD service.
+    with socket.create_connection((dc, 135)) as s:
+        bind_data = create_bind(
+            EMP,
+            bind_syntaxes,
+            sign_header=False,
+        )
+        s.sendall(bind_data)
+        resp = s.recv(4096)
+        parse_bind_ack(resp)
+
+        opnum, map_request = create_ept_map_request(ISD_KEY, NDR)
+        request = create_request(
+            opnum,
+            map_request,
+        )
+        s.sendall(request)
+        resp = s.recv(4096)
+
+        ept_response = parse_response(resp)
+        isd_towers = parse_ept_map_response(ept_response)
+        assert len(isd_towers) > 0
+        isd_port = isd_towers[0].port
+
     # DCE style is not exposed in pyspnego yet so use gssapi directly.
     negotiate_mech = gssapi.OID.from_int_seq("1.3.6.1.5.5.2")
     target_spn = gssapi.Name(f"host@{dc}", name_type=gssapi.NameType.hostbased_service)
@@ -837,13 +1035,11 @@ def get_key(
     out_token = ctx.step()
     assert out_token
 
-    # TODO: Use EPM to find the dynamic port for this service.
-    with socket.create_connection((dc, 49672)) as s:
+    with socket.create_connection((dc, isd_port)) as s:
         bind_data = create_bind(
             ISD_KEY,
-            1,
-            0,
-            out_token,
+            bind_syntaxes,
+            auth_data=out_token,
             sign_header=sign_header,
         )
 
@@ -857,8 +1053,6 @@ def get_key(
 
         alter_context = create_alter_context(
             ISD_KEY,
-            1,
-            0,
             out_token,
             sign_header=sign_header,
         )
@@ -871,17 +1065,17 @@ def get_key(
         assert not out_token
         # TODO: Deal with a no header signing.from server
 
-        get_key_req = create_get_key_request(target_sd, root_key_id, l0, l1, l2)
+        opnum, get_key_req = create_get_key_request(target_sd, root_key_id, l0, l1, l2)
         request = create_request(
-            0,
+            opnum,
             get_key_req,
-            ctx,
+            ctx=ctx,
             sign_header=sign_header,
         )
         s.sendall(request)
         resp = s.recv(4096)
 
-        create_key_resp = parse_response(resp, ctx, sign_header=sign_header)
+        create_key_resp = parse_response(resp, ctx=ctx, sign_header=sign_header)
         return parse_create_key_response(create_key_resp)
 
 
@@ -1102,40 +1296,74 @@ def main() -> None:
             64,
         )
 
-    # PrivKey(SD, RK, L0, L1, L2) = KDF(
-    #   HashAlg,
-    #   Key(SD, RK, L0, L1, L2),
-    #   "KDS service",
-    #   RK.msKds-SecretAgreement-AlgorithmID,
-    #   RK.msKds-PrivateKey-Length
+    # How the hell do I get this?
+    kek = b""
+
+    # # MS-GKDI - 3.1.4.1.2 Generating a Group key
+    # # To derive a group public key with a group key identifier (L0, L1, L2),
+    # # the server MUST proceed as follows:
+    # # First, the server MUST validate the root key configuration attributes
+    # # related to public keys
+
+    # # DH
+    # # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH",
+    # # RK.msKds-SecretAgreement-Param MUST be in the format specified in section
+    # # 2.2.2, and the Key length field of RK.msKds-SecretAgreement-Param MUST be
+    # # equal to RK.msKds-PublicKey-Length
+
+    # # TODO: Support ECHD keys
+    # assert rk.secret_algorithm == "DH"
+    # dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
+    # assert dh_parameters.key_length == (rk.public_key_length // 8)
+
+    # # 2. Having validated the root key configuration, the server MUST then
+    # # compute the group private key in the following manner:
+    # # PrivKey(SD, RK, L0, L1, L2) = KDF(
+    # #   HashAlg,
+    # #   Key(SD, RK, L0, L1, L2),
+    # #   "KDS service",
+    # #   RK.msKds-SecretAgreement-AlgorithmID,
+    # #   RK.msKds-PrivateKey-Length
+    # # )
+    # private_key = kdf(
+    #     hash_algo,
+    #     l2_key,
+    #     label,
+    #     (rk.secret_algorithm + "\0").encode("utf-16-le"),
+    #     math.ceil(rk.private_key_length / 8),
     # )
-    private_key = kdf(
-        hash_algo,
-        l2_key,
-        label,
-        (rk.secret_algorithm + "\0").encode("utf-16-le"),
-        math.ceil(rk.private_key_length / 8),
-    )
-    private_int = int.from_bytes(private_key, byteorder="big")
 
-    # TODO: Support ECDH keys
-    assert rk.secret_algorithm == "DH"
-    dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
-    assert dh_parameters.key_length == (rk.public_key_length // 8)
+    # # 3. Lastly, the server MUST compute the group public key
+    # # PubKey(SD, RK, L0, L1, L2) as follows:
 
-    p = int.from_bytes(dh_parameters.generator, byteorder="big")
-    g = int.from_bytes(dh_parameters.field_order, byteorder="big")
-    pub_key = pow(p, private_int, g)
+    # # DH
+    # # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH", the server MUST
+    # # compute PubKey(SD, RK, L0, L1, L2) by using the method specified in
+    # # [SP800-56A] section 5.6.1.1, with the group parameters specified in
+    # # RK.msKds-SecretAgreement-Param, and with PrivKey(SD, RK, L0, L1, L2) as
+    # # the private key
 
-    shared_key = pow(pub_key, private_int, p)
-    b_shared_key = shared_key.to_bytes((shared_key.bit_length() + 7) // 8, "big")
+    # # TODO: Support ECHD keys
 
-    kek = ConcatKDFHash(hash_algo, 32, otherinfo=None).derive(b_shared_key)
+    # # The static public key y is computed from the static private key x by using
+    # # the following formula
+    # # y = g**x mod p
+    # x = int.from_bytes(private_key, byteorder="big")
+    # p = int.from_bytes(dh_parameters.generator, byteorder="big")
+    # g = int.from_bytes(dh_parameters.field_order, byteorder="big")
+    # y = pow(g, x, p)
+    # public_key = y.to_bytes((y.bit_length() + 7) // 8, byteorder="big")
 
+    # # With the private and public key we can derive the shared secret
+    # dh_secret_int = pow(y, x, p)
+    # dh_secret = dh_secret_int.to_bytes((dh_secret_int.bit_length() + 7) // 8, byteorder="big")
+
+    # With the kek we can unwrap the encrypted cek in the LAPS payload.
     assert kek_algo.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
     assert not kek_algo.parameters
     cek = keywrap.aes_key_unwrap(kek, encrypted_cek)
 
+    # With the cek we can decrypt the encrypted content in the LAPS payload.
     password = aes256gcm_decrypt(content_algo, cek, laps_blob.encrypted_password)
     print(password)
 
