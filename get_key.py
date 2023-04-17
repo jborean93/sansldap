@@ -29,6 +29,7 @@ import sansldap
 from sansldap._pkcs7 import (
     AlgorithmIdentifier,
     ContentInfo,
+    EncryptedContentInfo,
     EnvelopedData,
     KEKRecipientInfo,
     NCryptProtectionDescriptor,
@@ -46,8 +47,7 @@ NDR64 = (uuid.UUID("71710533-beba-4937-8319-b5dbef9ccc36"), 1, 0)
 class EncryptedLAPSBlob:
     update_timestamp: int  # FILETIME int64
     flags: int
-    content_info: ContentInfo
-    encrypted_password: bytes
+    blob: bytes
 
     @classmethod
     def unpack(
@@ -65,18 +65,10 @@ class EncryptedLAPSBlob:
         assert len(blob) == blob_len
         assert len(view[16 + blob_len :]) == 0
 
-        # The blob contains a PKCS 7 ContentInfo value and the encrypted
-        # password blob straight after it. Peek at the header to get the length
-        # so we can get the encrypted password value after it.
-        header = ASN1Reader(blob).peek_header()
-        content_info = ContentInfo.unpack(blob[: header.tag_length + header.length], header=header)
-        enc_password = blob[header.tag_length + header.length :].tobytes()
-
         return EncryptedLAPSBlob(
             update_timestamp=update_timestamp,
             flags=flags,
-            content_info=content_info,
-            encrypted_password=enc_password,
+            blob=blob.tobytes(),
         )
 
 
@@ -1140,31 +1132,43 @@ def kdf(
     return kdf.derive(secret)
 
 
-def main() -> None:
-    dc = "dc01.domain.test"
-    server = "CN=SERVER2022,OU=Servers,DC=domain,DC=test"
-    sign_header = False
+def parse_dpapi_ng_blob(data: bytes) -> t.Tuple[KEKRecipientInfo, EncryptedContentInfo]:
+    view = memoryview(data)
+    header = ASN1Reader(view).peek_header()
+    content_info = ContentInfo.unpack(view[: header.tag_length + header.length], header=header)
+    remaining_data = view[header.tag_length + header.length :].tobytes()
 
-    enc_password = get_laps_enc_password(dc, server)
-    laps_blob = EncryptedLAPSBlob.unpack(enc_password)
+    assert content_info.content_type == EnvelopedData.content_type
+    enveloped_data = EnvelopedData.unpack(content_info.content)
 
-    assert laps_blob.content_info.content_type == EnvelopedData.content_type
-    enveloped_data = EnvelopedData.unpack(laps_blob.content_info.content)
     assert enveloped_data.version == 2
     assert len(enveloped_data.recipient_infos) == 1
     assert isinstance(enveloped_data.recipient_infos[0], KEKRecipientInfo)
-    assert enveloped_data.recipient_infos[0].kekid.other is not None
-    assert enveloped_data.recipient_infos[0].kekid.other.key_attr_id == "1.3.6.1.4.1.311.74.1"
-    protection_descriptor = NCryptProtectionDescriptor.unpack(
-        enveloped_data.recipient_infos[0].kekid.other.key_attr or b""
-    )
-    assert protection_descriptor.content_type == "1.3.6.1.4.1.311.74.1.1"
 
-    target_sid = protection_descriptor.value
-    password_id = EncPasswordId.unpack(enveloped_data.recipient_infos[0].kekid.key_identifier)
-    kek_algo = enveloped_data.recipient_infos[0].key_encryption_algorithm
-    encrypted_cek = enveloped_data.recipient_infos[0].encrypted_key
-    content_algo = enveloped_data.encrypted_content_info.content_encryption_algorithm
+    enc_content = enveloped_data.encrypted_content_info
+    if not enc_content.content and remaining_data:
+        # The LAPS payload seems to not include this in the payload but at the
+        # end of the content, just set it back on the structure.
+        object.__setattr__(enc_content, "encrypted_content", remaining_data)
+
+    return enveloped_data.recipient_infos[0], enc_content
+
+
+def ncrypt_unprotect_secret(
+    dc: str,
+    blob: bytes,
+    rpc_sign_header: bool = True,
+) -> bytes:
+    kek_info, enc_content = parse_dpapi_ng_blob(blob)
+
+    assert kek_info.version == 4
+    assert kek_info.kekid.other is not None
+    assert kek_info.kekid.other.key_attr_id == "1.3.6.1.4.1.311.74.1"
+    protection_descriptor = NCryptProtectionDescriptor.unpack(kek_info.kekid.other.key_attr or b"")
+    assert protection_descriptor.content_type == "1.3.6.1.4.1.311.74.1.1"
+    assert enc_content.content
+
+    password_id = EncPasswordId.unpack(kek_info.kekid.key_identifier)
 
     # Build the target security descriptor from the SID passed in. This SD
     # contains an ACE per target user with a mask of 0x3 and a final ACE of the
@@ -1174,7 +1178,7 @@ def main() -> None:
     target_sd = sd_to_bytes(
         owner="S-1-5-18",
         group="S-1-5-18",
-        dacl=[ace_to_bytes(target_sid, 3), ace_to_bytes("S-1-1-0", 2)],
+        dacl=[ace_to_bytes(protection_descriptor.value, 3), ace_to_bytes("S-1-1-0", 2)],
     )
 
     rk = get_key(
@@ -1184,7 +1188,7 @@ def main() -> None:
         password_id.l0,
         password_id.l1,
         password_id.l2,
-        sign_header=sign_header,
+        sign_header=rpc_sign_header,
     )
 
     # Now we have the key info we should be able to decrypt the original
@@ -1296,76 +1300,175 @@ def main() -> None:
             64,
         )
 
-    # How the hell do I get this?
-    kek = b""
+    # MS-GKDI - 3.1.4.1.2 Generating a Group key
+    # To derive a group public key with a group key identifier (L0, L1, L2),
+    # the server MUST proceed as follows:
+    # First, the server MUST validate the root key configuration attributes
+    # related to public keys
 
-    # # MS-GKDI - 3.1.4.1.2 Generating a Group key
-    # # To derive a group public key with a group key identifier (L0, L1, L2),
-    # # the server MUST proceed as follows:
-    # # First, the server MUST validate the root key configuration attributes
-    # # related to public keys
+    # DH
+    # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH",
+    # RK.msKds-SecretAgreement-Param MUST be in the format specified in section
+    # 2.2.2, and the Key length field of RK.msKds-SecretAgreement-Param MUST be
+    # equal to RK.msKds-PublicKey-Length
 
-    # # DH
-    # # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH",
-    # # RK.msKds-SecretAgreement-Param MUST be in the format specified in section
-    # # 2.2.2, and the Key length field of RK.msKds-SecretAgreement-Param MUST be
-    # # equal to RK.msKds-PublicKey-Length
+    # TODO: Support ECHD keys
+    assert rk.secret_algorithm == "DH"
+    dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
+    assert dh_parameters.key_length == (rk.public_key_length // 8)
 
-    # # TODO: Support ECHD keys
-    # assert rk.secret_algorithm == "DH"
-    # dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
-    # assert dh_parameters.key_length == (rk.public_key_length // 8)
-
-    # # 2. Having validated the root key configuration, the server MUST then
-    # # compute the group private key in the following manner:
-    # # PrivKey(SD, RK, L0, L1, L2) = KDF(
-    # #   HashAlg,
-    # #   Key(SD, RK, L0, L1, L2),
-    # #   "KDS service",
-    # #   RK.msKds-SecretAgreement-AlgorithmID,
-    # #   RK.msKds-PrivateKey-Length
-    # # )
-    # private_key = kdf(
-    #     hash_algo,
-    #     l2_key,
-    #     label,
-    #     (rk.secret_algorithm + "\0").encode("utf-16-le"),
-    #     math.ceil(rk.private_key_length / 8),
+    # 2. Having validated the root key configuration, the server MUST then
+    # compute the group private key in the following manner:
+    # PrivKey(SD, RK, L0, L1, L2) = KDF(
+    #   HashAlg,
+    #   Key(SD, RK, L0, L1, L2),
+    #   "KDS service",
+    #   RK.msKds-SecretAgreement-AlgorithmID,
+    #   RK.msKds-PrivateKey-Length
     # )
+    private_key = kdf(
+        hash_algo,
+        l2_key,
+        label,
+        (rk.secret_algorithm + "\0").encode("utf-16-le"),
+        math.ceil(rk.private_key_length / 8),
+    )
 
-    # # 3. Lastly, the server MUST compute the group public key
-    # # PubKey(SD, RK, L0, L1, L2) as follows:
+    # 3. Lastly, the server MUST compute the group public key
+    # PubKey(SD, RK, L0, L1, L2) as follows:
 
-    # # DH
-    # # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH", the server MUST
-    # # compute PubKey(SD, RK, L0, L1, L2) by using the method specified in
-    # # [SP800-56A] section 5.6.1.1, with the group parameters specified in
-    # # RK.msKds-SecretAgreement-Param, and with PrivKey(SD, RK, L0, L1, L2) as
-    # # the private key
+    # Test case
+    # P = b"\x0D"  # 13
+    # G = b"\x06"
+    # a = b"\x05"
+    # b = b"\x04"
+    # A = b"\x02"
+    # B = b"\x09"
+    # s = b"\x03"
 
-    # # TODO: Support ECHD keys
+    # actual = get_dh_pub(P, G, a)
+    # assert actual == A
 
-    # # The static public key y is computed from the static private key x by using
-    # # the following formula
-    # # y = g**x mod p
-    # x = int.from_bytes(private_key, byteorder="big")
-    # p = int.from_bytes(dh_parameters.generator, byteorder="big")
-    # g = int.from_bytes(dh_parameters.field_order, byteorder="big")
-    # y = pow(g, x, p)
-    # public_key = y.to_bytes((y.bit_length() + 7) // 8, byteorder="big")
+    # actual = get_dh_pub(P, G, b)
+    # assert actual == B
 
-    # # With the private and public key we can derive the shared secret
-    # dh_secret_int = pow(y, x, p)
-    # dh_secret = dh_secret_int.to_bytes((dh_secret_int.bit_length() + 7) // 8, byteorder="big")
+    # actual = get_dh_shared_secret(P, a, B)
+    # assert actual == s
+
+    # actual = get_dh_shared_secret(P, b, A)
+    # assert actual == s
+
+    # DH
+    # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH", the server MUST
+    # compute PubKey(SD, RK, L0, L1, L2) by using the method specified in
+    # [SP800-56A] section 5.6.1.1, with the group parameters specified in
+    # RK.msKds-SecretAgreement-Param, and with PrivKey(SD, RK, L0, L1, L2) as
+    # the private key
+    public_key = get_dh_pub(dh_parameters.field_order, dh_parameters.generator, private_key)
+
+    # TODO: Support ECHD keys
+
+    # With the private and public key we can derive the shared secret
+    # This isn't right we only have our private and public key. We need the
+    # peer's public key for this.
+    # shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, public_key)
+    shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, password_id.unknown)
+
+    # This is also not it.
+    kek = ConcatKDFHash(hash_algo, length=32, otherinfo=None).derive(shared_secret)
 
     # With the kek we can unwrap the encrypted cek in the LAPS payload.
-    assert kek_algo.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
-    assert not kek_algo.parameters
-    cek = keywrap.aes_key_unwrap(kek, encrypted_cek)
+    assert kek_info.key_encryption_algorithm.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
+    assert not kek_info.key_encryption_algorithm.parameters
+    cek = keywrap.aes_key_unwrap(kek, kek_info.encrypted_key)
 
     # With the cek we can decrypt the encrypted content in the LAPS payload.
-    password = aes256gcm_decrypt(content_algo, cek, laps_blob.encrypted_password)
-    print(password)
+    password = aes256gcm_decrypt(enc_content.algorithm, cek, enc_content.content)
+    return password
+
+
+def get_dh_pub(
+    field_order: bytes,
+    generator: bytes,
+    private: bytes,
+) -> bytes:
+    # The static public key y is computed from the static private key x by using
+    # the following formula
+    # y = g**x mod p
+
+    p_int = int.from_bytes(field_order, byteorder="big")
+    g_int = int.from_bytes(generator, byteorder="big")
+    x_int = int.from_bytes(private, byteorder="big")
+
+    public_int = pow(g_int, x_int, p_int)
+    return public_int.to_bytes((public_int.bit_length() + 7) // 8, byteorder="big")
+
+
+def get_dh_shared_secret(
+    field_order: bytes,
+    private: bytes,
+    public: bytes,
+) -> bytes:
+    p_int = int.from_bytes(field_order, byteorder="big")
+    x_int = int.from_bytes(private, byteorder="big")
+    y_int = int.from_bytes(public, byteorder="big")
+
+    secret = pow(y_int, x_int, p_int)
+    return secret.to_bytes((secret.bit_length() + 7) // 8, byteorder="big")
+
+
+def main() -> None:
+    dc = "dc01.domain.test"
+    server = "CN=SERVER2022,OU=Servers,DC=domain,DC=test"
+    sign_header = False
+
+    # Manual call to NCryptProtectSecret with b"\x01" - PowerShell
+    """
+    $ncrypt = New-CtypesLib ncrypt.dll
+
+    $descriptor = [IntPtr]::Zero
+    $res = $ncrypt.NCryptCreateProtectionDescriptor(
+        $ncrypt.MarshalAs("SID=$([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)", "LPWStr"),
+        0,
+        [ref]$descriptor)
+    if ($res) {
+        throw [System.ComponentModel.Win32Exception]$res
+    }
+
+    $data = [byte[]]::new(1)
+    $blob = [IntPtr]::Zero
+    $blobLength = 0
+    $res = $ncrypt.NCryptProtectSecret(
+        $descriptor,
+        0x40,  # NCRYPT_SILENT_FLAG
+        $ncrypt.MarshalAs($data, 'LPArray'),
+        $data.Length,
+        $null,
+        $null,
+        [ref]$blob,
+        [ref]$blobLength)
+    if ($res) {
+        throw [System.ComponentModel.Win32Exception]$res
+    }
+    $encBlob = [byte[]]::new($blobLength)
+    [System.Runtime.InteropServices.Marshal]::Copy($blob, $encBlob, 0, $encBlob.Length)
+    [System.Convert]::ToBase64String($encBlob)
+    """
+    enc_blob = base64.b64decode(
+        "MIIBeAYJKoZIhvcNAQcDoIIBaTCCAWUCAQIxggEeooIBGgIBBDCB3QSBhAEAAABLRFNLAgAAAGkBAAAPAAAAGwAAAKhPxrqQ6HyREJCD57D4WZYgAAAAGAAAABgAAAAa/cFOt3P0FBkN6GSXlXNOAl40T+fROdNdSUMskOmuKGQAbwBtAGEAaQBuAC4AdABlAHMAdAAAAGQAbwBtAGEAaQBuAC4AdABlAHMAdAAAADBUBgkrBgEEAYI3SgEwRwYKKwYBBAGCN0oBATA5MDcwNQwDU0lEDC5TLTEtNS0yMS00MTUxODA4Nzk3LTM0MzA1NjEwOTItMjg0MzQ2NDU4OC0xMTA0MAsGCWCGSAFlAwQBLQQoxsqDoXhEIMILLVXlzv5lxVBeFKMAERib1FLNLP2spEzg5FPGLL0hLDA+BgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDFtAVOwxnWdYMTxYyQIBEIARjFXg19IqURZ0g3hSWScPs24="
+    )
+    plaintext = ncrypt_unprotect_secret(dc, enc_blob, rpc_sign_header=sign_header)
+
+    # LAPS - msLAPS-EncryptedPassword
+    # enc_password = get_laps_enc_password(dc, server)
+    # laps_blob = EncryptedLAPSBlob.unpack(enc_password)
+    # plaintext = ncrypt_unprotect_secret(
+    #     dc,
+    #     laps_blob.blob,
+    #     rpc_sign_header=sign_header,
+    # )
+
+    print(f"Plaintext hex: {base64.b16encode(plaintext).decode()}")
 
 
 # Another example of the expanded msLAPS-EncryptedPassword value with some

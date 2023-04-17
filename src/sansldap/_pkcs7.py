@@ -237,8 +237,8 @@ class OtherKeyAttribute:
 @dataclasses.dataclass
 class EncryptedContentInfo:
     content_type: str
-    content_encryption_algorithm: AlgorithmIdentifier
-    encrypted_content: t.Optional[bytes]
+    algorithm: AlgorithmIdentifier
+    content: t.Optional[bytes]
 
     # EncryptedContentInfo ::= SEQUENCE {
     #     contentType ContentType,
@@ -270,8 +270,8 @@ class EncryptedContentInfo:
 
         return EncryptedContentInfo(
             content_type=content_type,
-            content_encryption_algorithm=content_encryption_algorithm,
-            encrypted_content=enc_content,
+            algorithm=content_encryption_algorithm,
+            content=enc_content,
         )
 
 
