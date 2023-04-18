@@ -16,6 +16,7 @@ import spnego
 from cryptography.hazmat.primitives import hashes, keywrap
 from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
 from cryptography.hazmat.primitives.kdf.kbkdf import KBKDFHMAC, CounterLocation, Mode
 from cryptography.hazmat.primitives.serialization import (
@@ -150,7 +151,7 @@ class GroupKeyEnvelope:
     # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf
     # 2.2.4 Group Key Envelope
     version: int
-    is_public_key: int
+    flags: int
     l0: int
     l1: int
     l2: int
@@ -166,6 +167,10 @@ class GroupKeyEnvelope:
     l1_key: bytes
     l2_key: bytes
 
+    @property
+    def is_public_key(self) -> bool:
+        return bool(self.flags & 1)
+
     @classmethod
     def unpack(
         cls,
@@ -177,7 +182,7 @@ class GroupKeyEnvelope:
 
         assert view[4:8].tobytes() == b"\x4B\x44\x53\x4B"
 
-        is_public_key = struct.unpack("<I", view[8:12])[0]
+        flags = struct.unpack("<I", view[8:12])[0]
         l0_index = struct.unpack("<I", view[12:16])[0]
         l1_index = struct.unpack("<I", view[16:20])[0]
         l2_index = struct.unpack("<I", view[20:24])[0]
@@ -220,7 +225,7 @@ class GroupKeyEnvelope:
 
         return GroupKeyEnvelope(
             version=version,
-            is_public_key=is_public_key,
+            flags=flags,
             l0=l0_index,
             l1=l1_index,
             l2=l2_index,
@@ -246,7 +251,7 @@ class EncPasswordId:
     # be missing a few fields. Anything beyond the root_key_identifier is guess
     # work based on the data seen.
     version: int
-    is_public_key: int
+    flags: int
     l0: int
     l1: int
     l2: int
@@ -254,6 +259,10 @@ class EncPasswordId:
     unknown: bytes
     domain_name: str
     forest_name: str
+
+    @property
+    def is_public_key(self) -> bool:
+        return bool(self.flags & 1)
 
     @classmethod
     def unpack(
@@ -266,7 +275,7 @@ class EncPasswordId:
 
         assert view[4:8].tobytes() == b"\x4B\x44\x53\x4B"
 
-        is_public_key = struct.unpack("<I", view[8:12])[0]
+        flags = struct.unpack("<I", view[8:12])[0]
         l0_index = struct.unpack("<I", view[12:16])[0]
         l1_index = struct.unpack("<I", view[16:20])[0]
         l2_index = struct.unpack("<I", view[20:24])[0]
@@ -288,7 +297,7 @@ class EncPasswordId:
 
         return EncPasswordId(
             version=version,
-            is_public_key=is_public_key,
+            flags=flags,
             l0=l0_index,
             l1=l1_index,
             l2=l2_index,
@@ -1080,12 +1089,12 @@ def aes256gcm_decrypt(
     assert algorithm.algorithm == "2.16.840.1.101.3.4.1.46"  # AES256-GCM
     assert algorithm.parameters
     reader = ASN1Reader(algorithm.parameters).read_sequence()
-    nonce = reader.read_octet_string()
-    iv_len = reader.read_integer()
-    iv = b"\x00" * iv_len
+    iv = reader.read_octet_string()
 
-    decryptor = Cipher(algorithms.AES(key), modes.GCM(iv)).decryptor()
-    return decryptor.update(secret) + decryptor.finalize()
+    cipher = AESGCM(key)
+    data = cipher.decrypt(iv, secret, None)
+
+    return data
 
 
 def compute_kdf_context(
@@ -1111,9 +1120,6 @@ def kdf(
     label: bytes,
     context: bytes,
     length: int,
-    *,
-    rlen: int = 4,
-    llen: int = 4,
 ) -> bytes:
     # KDF(HashAlg, KI, Label, Context, L)
     # where KDF is SP800-108 in counter mode.
@@ -1123,9 +1129,10 @@ def kdf(
         length=length,
         label=label,
         context=context,
-        # I'm just guessing at these options
-        rlen=rlen,
-        llen=llen,
+        # MS-SMB2 uses the same KDF function and my implementation that
+        # sets a value of 4 seems to work so assume that's the case here.
+        rlen=4,
+        llen=4,
         location=CounterLocation.BeforeFixed,
         fixed=None,
     )
@@ -1149,7 +1156,7 @@ def parse_dpapi_ng_blob(data: bytes) -> t.Tuple[KEKRecipientInfo, EncryptedConte
     if not enc_content.content and remaining_data:
         # The LAPS payload seems to not include this in the payload but at the
         # end of the content, just set it back on the structure.
-        object.__setattr__(enc_content, "encrypted_content", remaining_data)
+        object.__setattr__(enc_content, "content", remaining_data)
 
     return enveloped_data.recipient_infos[0], enc_content
 
@@ -1375,12 +1382,16 @@ def ncrypt_unprotect_secret(
     shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, password_id.unknown)
 
     # This is also not it.
-    kek = ConcatKDFHash(hash_algo, length=32, otherinfo=None).derive(shared_secret)
+    # kek = ConcatKDFHash(hash_algo, length=32, otherinfo=None).derive(shared_secret)
+    kek = b""
 
     # With the kek we can unwrap the encrypted cek in the LAPS payload.
     assert kek_info.key_encryption_algorithm.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
     assert not kek_info.key_encryption_algorithm.parameters
-    cek = keywrap.aes_key_unwrap(kek, kek_info.encrypted_key)
+    # cek = keywrap.aes_key_unwrap(kek, kek_info.encrypted_key)
+
+    # This is the cek that is expected
+    cek = base64.b16decode("87AF93EB25B37D7FA2E73E64CA337F2C152E5F14BE83A8A215797321EFDCECD2")
 
     # With the cek we can decrypt the encrypted content in the LAPS payload.
     password = aes256gcm_decrypt(enc_content.algorithm, cek, enc_content.content)
@@ -1454,22 +1465,254 @@ def main() -> None:
     [System.Runtime.InteropServices.Marshal]::Copy($blob, $encBlob, 0, $encBlob.Length)
     [System.Convert]::ToBase64String($encBlob)
     """
-    enc_blob = base64.b64decode(
-        "MIIBeAYJKoZIhvcNAQcDoIIBaTCCAWUCAQIxggEeooIBGgIBBDCB3QSBhAEAAABLRFNLAgAAAGkBAAAPAAAAGwAAAKhPxrqQ6HyREJCD57D4WZYgAAAAGAAAABgAAAAa/cFOt3P0FBkN6GSXlXNOAl40T+fROdNdSUMskOmuKGQAbwBtAGEAaQBuAC4AdABlAHMAdAAAAGQAbwBtAGEAaQBuAC4AdABlAHMAdAAAADBUBgkrBgEEAYI3SgEwRwYKKwYBBAGCN0oBATA5MDcwNQwDU0lEDC5TLTEtNS0yMS00MTUxODA4Nzk3LTM0MzA1NjEwOTItMjg0MzQ2NDU4OC0xMTA0MAsGCWCGSAFlAwQBLQQoxsqDoXhEIMILLVXlzv5lxVBeFKMAERib1FLNLP2spEzg5FPGLL0hLDA+BgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDFtAVOwxnWdYMTxYyQIBEIARjFXg19IqURZ0g3hSWScPs24="
-    )
-    plaintext = ncrypt_unprotect_secret(dc, enc_blob, rpc_sign_header=sign_header)
+    # enc_blob = base64.b64decode(
+    #     "MIIBeAYJKoZIhvcNAQcDoIIBaTCCAWUCAQIxggEeooIBGgIBBDCB3QSBhAEAAABLRFNLAgAAAGkBAAAPAAAAGwAAAKhPxrqQ6HyREJCD57D4WZYgAAAAGAAAABgAAAAa/cFOt3P0FBkN6GSXlXNOAl40T+fROdNdSUMskOmuKGQAbwBtAGEAaQBuAC4AdABlAHMAdAAAAGQAbwBtAGEAaQBuAC4AdABlAHMAdAAAADBUBgkrBgEEAYI3SgEwRwYKKwYBBAGCN0oBATA5MDcwNQwDU0lEDC5TLTEtNS0yMS00MTUxODA4Nzk3LTM0MzA1NjEwOTItMjg0MzQ2NDU4OC0xMTA0MAsGCWCGSAFlAwQBLQQoxsqDoXhEIMILLVXlzv5lxVBeFKMAERib1FLNLP2spEzg5FPGLL0hLDA+BgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDFtAVOwxnWdYMTxYyQIBEIARjFXg19IqURZ0g3hSWScPs24="
+    # )
+    # plaintext = ncrypt_unprotect_secret(dc, enc_blob, rpc_sign_header=sign_header)
 
     # LAPS - msLAPS-EncryptedPassword
-    # enc_password = get_laps_enc_password(dc, server)
-    # laps_blob = EncryptedLAPSBlob.unpack(enc_password)
-    # plaintext = ncrypt_unprotect_secret(
-    #     dc,
-    #     laps_blob.blob,
-    #     rpc_sign_header=sign_header,
-    # )
+    enc_password = get_laps_enc_password(dc, server)
+    laps_blob = EncryptedLAPSBlob.unpack(enc_password)
+    plaintext = ncrypt_unprotect_secret(
+        dc,
+        laps_blob.blob,
+        rpc_sign_header=sign_header,
+    )
+    print(f"LAPS Password: {plaintext.decode('utf-16-le')}")
 
     print(f"Plaintext hex: {base64.b16encode(plaintext).decode()}")
 
+
+"""
+Here is what I'm currently up to.
+
+I can use LDAP to query the LDAP attribute 'msLAPS-EncryptedPassword' on the
+compute object in question. The value of this attribute is a blob in the form
+of:
+
+    update_timestamp_upper: 4 bytes
+    update_timestamp_lower: 4 bytes
+    blob_length: 4 bytes
+    flags: 4 bytes
+    blob: variable (blob_length)
+
+It is simple to unpack this and so far I've found that a blob never contains
+any flags (always 0) and the blob itself is a PKCS 7 ContentInto structure with
+some bytes added onto the end. The ContentInfo structure has a content type of
+'1.2.840.113549.1.7.3' which represents the PKCS 7 envelopedData structure
+defined in RFC 5652 6.1. EnvelopedData Type
+https://www.rfc-editor.org/rfc/rfc5652#section-6.1
+
+      EnvelopedData ::= SEQUENCE {
+        version CMSVersion,
+        originatorInfo [0] IMPLICIT OriginatorInfo OPTIONAL,
+        recipientInfos RecipientInfos,
+        encryptedContentInfo EncryptedContentInfo,
+        unprotectedAttrs [1] IMPLICIT UnprotectedAttributes OPTIONAL }
+
+In this case the version of the EnvelopedData is set to 2 and it contains a
+single recipientInfo and an encryptedContentInfo. The encryptedContentInfo is
+defined in the same RFC as EncryptedContentInfo with the structure
+
+      EncryptedContentInfo ::= SEQUENCE {
+        contentType ContentType,
+        contentEncryptionAlgorithm ContentEncryptionAlgorithmIdentifier,
+        encryptedContent [0] IMPLICIT EncryptedContent OPTIONAL }
+
+Note: The ContentEncryptionAlgorithmIdentifier is just the AlgorithmIdentifier
+defined in another RFC as.
+
+    AlgorithmIdentifier ::= SEQUENCE {
+        algorithm       OBJECT IDENTIFIER,
+        parameters      ANY DEFINED BY algorithm OPTIONAL
+    }
+
+The encryptedContent tag is not actually set for LAPS, the remaining data in
+LAPS blob seem to substitute this value. I don't know why it isn't included in
+the EncryptedContentInfo structure like NCryptProtectSecret usually does but
+it isn't.
+
+The recipientInfos contains a single entry which is a KEKRecipientInfo type
+which is defined in RFC 5652 6.2.3. KEKRecipientInfoType as
+
+      KEKRecipientInfo ::= SEQUENCE {
+        version CMSVersion,  -- always set to 4
+        kekid KEKIdentifier,
+        keyEncryptionAlgorithm KeyEncryptionAlgorithmIdentifier,
+        encryptedKey EncryptedKey }
+
+      KEKIdentifier ::= SEQUENCE {
+        keyIdentifier OCTET STRING,
+        date GeneralizedTime OPTIONAL,
+        other OtherKeyAttribute OPTIONAL }
+
+When unpacking the blob these are the values I get:
+
+    EncryptedContentInfo:
+        contentType:
+        contentEncryptionAlgorithm:
+            algorithm: 2.16.840.1.101.3.4.1.46  # AES256-GCM
+            # A nested ASN.1 value containing the nonce and icvlen
+            parameters: ...
+        # Not actually in the structure but after the PKCS 7 ContentInfo
+        # structure. Just mentioned here for posterity.
+        encryptedContent: ...
+
+    # Contains only 1 recipientinfo - KEKRecipientInfo
+    RecipientInfos:
+        kekid:
+            # This contains the password root key id and L* values
+            keyIdentifier: ...
+            other:
+                keyattrId: 1.3.6.1.4.1.311.74.1
+                # This contains an undocumented ASN.1 value
+                keyattr: ...
+        keyEncryptionAlgorithm:
+            algorithm: 2.16.840.1.101.3.4.1.45  # AES256 wrap
+            parameters: ''  # No parameters
+
+        # I believe this to be the encrypted CEK (encrypted by the KEK)
+        encryptedKey: ...
+
+The keyIdentifier is an undocumented structure in the form of:
+
+    version: 4 bytes (always 1)
+    magic: 0x4B 0x44 0x53 0x4B
+    flags: 4 bytes (typically 2)
+    l0_index: 4 bytes
+    l1_index: 4 bytes
+    l2_index: 4 bytes
+    root_key_identifier: 16 bytes
+    unknown_length: 4 bytes
+    domain_length: 4 bytes
+    forest_length: 4 bytes
+    unknown: variable (unknown_length)
+    domain: variable (domain_length)
+    forest: variable (forest_length)
+
+If the flags has bit 1 set then the unknown value represents the public key of
+the DH pair. If it's not set then it's a 32 byte value that I have no idea of.
+I think this is important but I don't understand why I typically only get the
+32 byte value but I definitely got the DH public key once before.
+
+The kekid.other value contains an undocumented ASN.1 value that is simply 2
+UTF-8 string 'SID' and the sid that protected the blob (what LAPS is registered
+with).
+
+So with all this info I have:
+    * The SID that protects the resource
+    * The group key (keyidentifier) identifier
+        * L0 id
+        * L1 id
+        * L2 id
+        * Root Key Identifier
+        * The domain/forest name to query
+        * Maybe the public key (typically not though)
+    * The encrypted CEK (encryptedKey)
+    * The encrypted CEK encryption algorithm - AES256 wrap
+    * The encrypted LAPS content
+    * The encrypted LAPS content encryption algorithm AES256-GCM with a nonce
+
+With this info I can call the MS-GKDI GetKey https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/4cac87a3-521e-4918-a272-240f8fabed39
+with the details in the group key identifier and the SID wrapped in a security
+descriptor. Note the security descriptor has the owner and group of S-1-5-18
+and 2 ACES in the DACL. One ACE has a mask of 3 containing the SID in the LAPS
+payload, another ACE has S-1-1-0 with a mask of 2. This is the behaviour seen
+on the wire so I just replicated it.
+
+This call must be done with RCP over TCP/IP with privary applied to the
+connection. The EPM on port 135 can be first queried to see what ports the
+GetKey interface is registered on.
+
+The returned value is a blob in the form of MS-GKDI Group key Envelope
+https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/192c061c-e740-4aa0-ab1d-6954fb3e58f7
+Relevant values contained in this structure are:
+
+    L0 index: Typically the same as the L0 id requested
+    L1 index: Typically the same as the L1 id requested
+    L2 index: Maybe the same or higher than the L2 id requested
+    L1 key: The L1 seed key (64 bytes)
+    L2 key: The L2 seed key (64 bytes)
+    KDF Algorithm: SP800_108_CTR_HMAC
+    KDF Parameters: SHA512
+    Secret Algorithm: DH
+    Secret Parameters:  The p and g integers as big endian bytes
+    Private Key Length: 512  # In bits
+    Public Key Length: 2048  # In bits
+
+Depending on when LAPS password was set the L2 index returned could be the same
+or a higher value. Strictly speaking L1 could also differ but I haven't been
+dealing with timeframes for that to ever change. Using MS-GKDI Generating a
+Group Key https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/5d373568-dd68-499b-bd06-a3ce16ca7117
+I can work backwards to derive the L2 seed key for the L0, L1, L2 identifier
+stored in the keyidentifier based on the values returned from GetKey. The docs
+state the following algorithm is used to derive the L2 seed key
+
+    KDF(HashAlg, KI, Label, Context, L) — denotes an execution of the [SP800-108] KDF in counter mode ([SP800-108] section 5.1) by using the Hash Message Authentication Code (HMAC)
+    Key(SD, RK, L0, L1, n) = KDF(HashAlg, Key(SD, RK, L0, L1, n+1), "KDS service", RKID || L0 || L1|| n, 512)
+
+Essentially the L2 seed key of (1, 2, 3) is equal to
+
+    KDF(
+        SHA512,
+        L2(RK, 1, 2, 4),
+        "KDS service",
+        RKID | 1 | 2 | 3,
+        512
+    )
+
+So if the L2 index matches what we requested we don't need to do anything but
+if it does not we can continue to work backwards and derive the key for the
+previous L2 index until we reach the one we need as specified in the
+key identifier.
+
+One thing to note is that SP800-108 in Python is done with KBKDFHMAC
+https://cryptography.io/en/latest/hazmat/primitives/key-derivation-functions/#cryptography.hazmat.primitives.kdf.kbkdf.KBKDFHMAC
+This class takes in the inputs documented by Microsoft but it also requires a
+value for rlen and llen. I need to figure out what this should actually be as
+MS-GKDI don't seem to mention it.
+
+In the same section of MS-GKDI we can see the algorithm for generating the DH
+private key is with
+
+    PrivKey(SD, RK, L0, L1, L2) = KDF(HashAlg, Key(SD, RK, L0, L1, L2), "KDS service", RK.msKds-SecretAgreement-AlgorithmID, RK.msKds-PrivateKey-Length)
+
+So we can do the following to derive the DH private "key":
+
+    KDF(
+        SHA512,
+        L2(RK, 1, 2, 3),
+        "KDS service",
+        "DH",
+        512
+    )
+
+It also states the public key can be derived from this using the NIST SP800-56A
+specs 5.6.1.1. As it's a DH key and we know the p, g, and private key (x) values
+this is simply done with g**x mod p.
+
+Now this is where I'm stuck. Based on the docs for DPAPI-NG
+https://learn.microsoft.com/en-us/windows/win32/seccng/protected-data-format
+it somewhat states the CEK is the encryptedKey inside the recipient info is
+encrypted with the KEK. It seems like the KEK is derived by doing AES256 unwrap
+on some value but nothing I've tried results in a successful unwrap. At a guess
+I need to derive the shared DH secret and potentially use that for the AES256
+unwrap but this brings up the questions:
+
+* How do I get the DH secret when I don't know the other parties public key (Y)
+    * The DH formula is meant to be Y ** x mod p
+    * I know p, g, x (my private key), and X (my public key) but not y or Y
+    * Randomly I've seen the password identifier in the kekid keyIdentifier
+        field but that was only once
+    * Is the random 32 byte value in the kekid keyIdentifier somewhat related
+        to this?
+    * Once I do get this secret, do I need to hash it to get the 32 byte length
+        expected by AES256 key unwrap
+
+Assuming I figure out how to get the decrypted CEK with the above I should then
+be able to use that as the key in the AES256-GCM decryption process on the
+LAPS encrypted content to get the encrypted payload.
+"""
 
 # Another example of the expanded msLAPS-EncryptedPassword value with some
 # hints on the values.
