@@ -7,6 +7,7 @@ import math
 import re
 import socket
 import struct
+import sys
 import typing as t
 import uuid
 
@@ -1107,9 +1108,9 @@ def compute_kdf_context(
     # mention how they are all joined together. GoldenGMSA only uses
     # (RK, L0, L1, K2) concatenated together. Probably needs more investigation.
     context = key_guid.bytes_le
-    context += struct.pack("<I", l0)
-    context += struct.pack("<I", l1)
-    context += struct.pack("<I", l2)
+    context += struct.pack("<i", l0)
+    context += struct.pack("<i", l1)
+    context += struct.pack("<i", l2)
 
     return context
 
@@ -1261,8 +1262,8 @@ def ncrypt_unprotect_secret(
     # This is not right and just me spitballing trying to figure things out.
     # MS-GKDI 3.1.4.1.2 Generating a Group Key
     # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf#%5B%7B%22num%22%3A91%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C69%2C557%2C0%5D
-    print(f"PasswordId L0 {password_id.l0} L1 {password_id.l1} L2 {password_id.l2}")
-    print(f"GroupKeyId L0 {rk.l0} L1 {rk.l1} L2 {rk.l2}")
+    # print(f"PasswordId L0 {password_id.l0} L1 {password_id.l1} L2 {password_id.l2}")
+    # print(f"GroupKeyId L0 {rk.l0} L1 {rk.l1} L2 {rk.l2}")
     label = "KDS service\0".encode("utf-16-le")
 
     assert rk.version == 1
@@ -1281,9 +1282,44 @@ def ncrypt_unprotect_secret(
     else:
         raise Exception(f"Unsupported hash algorithm {kdf_parameters.hash_name}")
 
-    # TODO: Deal with L1 differences.
-    l2_key = rk.l2_key
+    # TODO: Deal with L0 differences.
+    l1 = rk.l1
+    l1_key = rk.l1_key
     l2 = rk.l2
+    l2_key = rk.l2_key
+
+    if password_id.l1 != l1:
+        l1 = rk.l1 - 1
+
+        while password_id.l1 != l1:
+            l1 -= 1
+            l1_key = kdf(
+                hash_algo,
+                l1_key,
+                label,
+                compute_kdf_context(
+                    rk.root_key_identifier,
+                    rk.l0,
+                    l1,
+                    -1,
+                ),
+                64,
+            )
+
+        l2 = 31
+        l2_key = kdf(
+            hash_algo,
+            l1_key,
+            label,
+            compute_kdf_context(
+                rk.root_key_identifier,
+                rk.l0,
+                l1,
+                l2,
+            ),
+            64,
+        )
+
     while l2 != password_id.l2:
         l2 -= 1
 
@@ -1291,7 +1327,7 @@ def ncrypt_unprotect_secret(
         #   HashAlg,
         #   Key(SD, RK, L0, L1, n+1),
         #   "KDS service",
-        #   RKID || L0 ||L1|| n,
+        #   RKID || L0 || L1 || n,
         #   512
         # )
         l2_key = kdf(
@@ -1301,7 +1337,7 @@ def ncrypt_unprotect_secret(
             compute_kdf_context(
                 rk.root_key_identifier,
                 rk.l0,
-                rk.l1,
+                l1,
                 l2,
             ),
             64,
@@ -1379,19 +1415,102 @@ def ncrypt_unprotect_secret(
     # This isn't right we only have our private and public key. We need the
     # peer's public key for this.
     # shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, public_key)
-    shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, password_id.unknown)
+    # shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, password_id.unknown)
 
-    # This is also not it.
-    # kek = ConcatKDFHash(hash_algo, length=32, otherinfo=None).derive(shared_secret)
-    kek = b""
+    # Manual run from Windows and their results
+    """
+BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE6A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69390, SecretLength: 64, Flags: 0x00000000) -> Secret: 47D6429C3531529118726E7CAB366777CB4388BA0F6E160A75D7432A1F47FC2BB9F385E90E5393990A352D481907E540A91EDB10BEF4EAACC90F7CFA5446966F
+BCryptGenerateSymmetricKey -> Res: 0x00000000
+
+BCryptKeyDerivation(Key: 0x2DB52AFBBC0, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69390, DerivedKeyLength: 64, OutKeyLength: 0xB97DAFE694, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
+                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000A84FC6BA90E87C91109083E7B0F85996690100000F0000001F000000
+                        Label: KDS service
+                        Context: A84FC6BA90E87C91109083E7B0F85996690100000F0000001F000000
+                                RootKeyId: 168 79 198 186 144 232 124 145 16 144 131 231 176 248 89 150
+                                L0: 361
+                                L1: 15
+                                L2: 31
+BCryptKeyDerivation -> Res: 0x00000000, Derived: E8538AF97E87306C9CE2E327905EB932220E76DA3946E94AB26A9748206F927F0324A7024C3596E76ADA8E68FE3A592FA80446956F58238532A3434F0B5C1B38, A: 0x2DB52F69390
+
+BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE6A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69390, SecretLength: 64, Flags: 0x00000000) -> Secret: E8538AF97E87306C9CE2E327905EB932220E76DA3946E94AB26A9748206F927F0324A7024C3596E76ADA8E68FE3A592FA80446956F58238532A3434F0B5C1B38
+BCryptGenerateSymmetricKey -> Res: 0x00000000
+
+BCryptKeyDerivation(Key: 0x2DB52AFB380, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69390, DerivedKeyLength: 64, OutKeyLength: 0xB97DAFE694, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
+                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000A84FC6BA90E87C91109083E7B0F85996690100000F0000001E000000
+                        Label: KDS service
+                        Context: A84FC6BA90E87C91109083E7B0F85996690100000F0000001E000000
+                                RootKeyId: 168 79 198 186 144 232 124 145 16 144 131 231 176 248 89 150
+                                L0: 361
+                                L1: 15
+                                L2: 30
+BCryptKeyDerivation -> Res: 0x00000000, Derived: 3B369385E623113F0B850E9FB378E164123C3845D523EB1C2ACD0325D1F497D28EBA41F642E7AAC35AAD0AF6CEC62B4192C06F9B8A9DFAF42F107FA5CDAAF11D, A: 0x2DB52F69390
+
+BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE6A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69390, SecretLength: 64, Flags: 0x00000000) -> Secret: 3B369385E623113F0B850E9FB378E164123C3845D523EB1C2ACD0325D1F497D28EBA41F642E7AAC35AAD0AF6CEC62B4192C06F9B8A9DFAF42F107FA5CDAAF11D
+BCryptGenerateSymmetricKey -> Res: 0x00000000
+
+BCryptKeyDerivation(Key: 0x2DB52AFBBC0, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69390, DerivedKeyLength: 64, OutKeyLength: 0xB97DAFE694, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
+                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000A84FC6BA90E87C91109083E7B0F85996690100000F0000001D000000
+                        Label: KDS service
+                        Context: A84FC6BA90E87C91109083E7B0F85996690100000F0000001D000000
+                                RootKeyId: 168 79 198 186 144 232 124 145 16 144 131 231 176 248 89 150
+                                L0: 361
+                                L1: 15
+                                L2: 29
+BCryptKeyDerivation -> Res: 0x00000000, Derived: 98DF72B98DBA8661B4AFAE0ABA605015114B8A94BCF0843A1FFAF71DEEE6F49CAEFA570D4CF75F1A0F5676E31603CA8B783EBB839BAD8C344EDFDEF7C6ACE974, A: 0x2DB52F69390
+
+BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE780, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69190, SecretLength: 64, Flags: 0x00000000)
+    Secret: 98DF72B98DBA8661B4AFAE0ABA605015114B8A94BCF0843A1FFAF71DEEE6F49CAEFA570D4CF75F1A0F5676E31603CA8B783EBB839BAD8C344EDFDEF7C6ACE974
+BCryptGenerateSymmetricKey -> Res: 0x00000000
+
+BCryptKeyDerivation(Key: 0x2DB52AFAE00, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69190, DerivedKeyLength: 32, OutKeyLength: 0xB97DAFE774, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
+                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B00440053002000730065007200760069006300650000000016B3FA1BFC1066B30B63B29A2D29F31D82FB5AE3CC05F86ECB67EFAC69F2CE55
+                        Label: KDS service
+                        Context: 16B3FA1BFC1066B30B63B29A2D29F31D82FB5AE3CC05F86ECB67EFAC69F2CE55
+BCryptKeyDerivation -> Res: 0x00000000, Derived: FBD5A5143F23822E3F8B7A195F7216E554BEE383A645241BBCFC155EEBF622D3, A: 0x2DB52F69190
+    """
+
+    expected_l2_key = base64.b16decode(
+        "98DF72B98DBA8661B4AFAE0ABA605015114B8A94BCF0843A1FFAF71DEEE6F49CAEFA570D4CF75F1A0F5676E31603CA8B783EBB839BAD8C344EDFDEF7C6ACE974"
+    )
+    # FIXME: My L2 seed key calculation is wrong. The above result is what I
+    # sniffed from Windows when tracing the BCrypt functions.
+    l2_key = expected_l2_key
+    assert (
+        l2_key == expected_l2_key
+    ), f"L2 Key Mismatch\n{base64.b16encode(l2_key).decode()}\n{base64.b16encode(expected_l2_key).decode()}"
+
+    kek = kdf(
+        hash_algo,
+        l2_key,
+        label,
+        password_id.unknown,
+        32,
+    )
+
+    # This is the expected KEK for this
+    expected_kek = base64.b16decode("FBD5A5143F23822E3F8B7A195F7216E554BEE383A645241BBCFC155EEBF622D3")
+    assert (
+        kek == expected_kek
+    ), f"KEK Mismatch\n{base64.b16encode(kek).decode()}\n{base64.b16encode(expected_kek).decode()}"
 
     # With the kek we can unwrap the encrypted cek in the LAPS payload.
     assert kek_info.key_encryption_algorithm.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
     assert not kek_info.key_encryption_algorithm.parameters
-    # cek = keywrap.aes_key_unwrap(kek, kek_info.encrypted_key)
+    cek = keywrap.aes_key_unwrap(kek, kek_info.encrypted_key)
 
-    # This is the cek that is expected
-    cek = base64.b16decode("87AF93EB25B37D7FA2E73E64CA337F2C152E5F14BE83A8A215797321EFDCECD2")
+    # This is the expected CEK for this
+    expected_cek = base64.b16decode("87AF93EB25B37D7FA2E73E64CA337F2C152E5F14BE83A8A215797321EFDCECD2")
+    assert (
+        cek == expected_cek
+    ), f"CEK Mismatch\n{base64.b16encode(cek).decode()}\n{base64.b16encode(expected_cek).decode()}"
 
     # With the cek we can decrypt the encrypted content in the LAPS payload.
     password = aes256gcm_decrypt(enc_content.algorithm, cek, enc_content.content)
@@ -1433,6 +1552,10 @@ def main() -> None:
     server = "CN=SERVER2022,OU=Servers,DC=domain,DC=test"
     sign_header = False
 
+    # Delete the key under C:\Users\vagrant-domain\AppData\Local\Microsoft\Crypto\KdsKey\62dfbd45d9ce7632efd1f252eedb7a94b806849138424140b12517aa45eb1f47\PrivateKey\361-bac64fa8-e890-917c-1090-83e7b0f85996
+    # to test out the RPC traffic. Will need to figure out how this format is created.
+    # GetSIDKeyFileName in KdsCli.dll
+
     # Manual call to NCryptProtectSecret with b"\x01" - PowerShell
     """
     $ncrypt = New-CtypesLib ncrypt.dll
@@ -1470,6 +1593,11 @@ def main() -> None:
     # )
     # plaintext = ncrypt_unprotect_secret(dc, enc_blob, rpc_sign_header=sign_header)
 
+    # enc_blob = base64.b16decode(
+    #     "3082045006092a864886f70d010703a08204413082043d02010231820409a2820405020104308203c704820370010000004b44534b03000000690100000f0000001e00000069d83cd1d10ebfac4620a164e805f56e080300001a0000001a000000444850420001000087a8e61db4b6663cffbbd19c651959998ceef608660dd0f25d2ceed4435e3b00e00df8f1d61957d4faf7df4561b2aa3016c3d91134096faa3bf4296d830e9a7c209e0c6497517abd5a8a9d306bcf67ed91f9e6725b4758c022e0b1ef4275bf7b6c5bfc11d45f9088b941f54eb1e59bb8bc39a0bf12307f5c4fdb70c581b23f76b63acae1caa6b7902d52526735488a0ef13c6d9a51bfa4ab3ad8347796524d8ef6a167b5a41825d967e144e5140564251ccacb83e6b486f6b3ca3f7971506026c0b857f689962856ded4010abd0be621c3a3960a54e710c375f26375d7014103a4b54330c198af126116d2276e11715f693877fad7ef09cadb094ae91e1a15973fb32c9b73134d0b2e77506660edbd484ca7b18f21ef205407f4793a1a0ba12510dbc15077be463fff4fed4aac0bb555be3a6c1b0c6b47b1bc3773bf7e8c6f62901228f8c28cbb18a55ae31341000a650196f931c77a57f2ddf463e5e9ec144b777de62aaab8a8628ac376d282d6ed3864e67982428ebc831d14348f6f2f9193b5045af2767164e1dfc967c1fb3f2e55a4bd1bffe83b9c80d052b985d182ea0adb2a3b7313d3fe14c8484b1e052588b9b7d2bbd2df016199ecd06e1557cd0915b3353bbb64e0ec377fd028370df92b52c7891428cdc67eb6184b523d1db246c32f63078490f00ef8d647d148d47954515e2327cfef98c582664b4c0f6cc4165911914ea310a2766c1ec2f5ba89d34002d975da503cc1809d05249fbad13f038a5a9fcb381601e04ec4b9b4f31f6ef25a3f56356d28590727df18f626a04caa3cd81ec602c22e0172a029256caf961a461e3ab61502ee6f27f1f134a88f37019534c7075cfe990ecfe535d1042ee1964af66a7e9e1167a0ffbd8359a6042a3117102240cf5cfd9c442259f0f3db45d1dd51a10e7f3e314250f2079b6122d84ebd9d405c83826d625c8a57dfe518389d645ee4daec02d48b7470e8419c84ed7bcabaf47ded6a1b1f132010d35004adf37fec61dfbc008fda690389ed945ea96bad5f3acffe0fe01f818cd10d01d58d012a37b98758928531d9bf5a614041f4cfbf4e00450057004c004100500053002e0043004f005200500000004e00450057004c004100500053002e0043004f00520050000000305106092b0601040182374a013044060a2b0601040182374a01013036303430320c035349440c2b532d312d352d32312d39323130343037302d313632323731323839342d333433363534373836332d353132300b060960864801650304012d04281a7b6922fc2450c81354ad9d3ce1020d24c327a071f57de6a74dddf3c0b4acb9cf3104efc06fb18d302b06092a864886f70d010701301e060960864801650304012e3011040c247911a21b5c7f4fd08359f9020110426af21e4b446113ce8c4ea45685ecf21d800047f61d5772452b3dab1efc093692f0e3fa3a16ad0fbdbe0df9e9953a934ff129848d34c1e1bc2f5eaefbe67eaa40f158759144b800325ac1307aafd02ce418badf3a9ed849d4053ffde7c2a3822d169377ebcce5c9a9a1a95261c02d49ba014edf882aa54141d0d9b5aa03155eef9f05a0233dbbd9c45f62f58f407cd25320".upper()
+    # )
+    # plaintext = ncrypt_unprotect_secret(dc, enc_blob, rpc_sign_header=sign_header)
+
     # LAPS - msLAPS-EncryptedPassword
     enc_password = get_laps_enc_password(dc, server)
     laps_blob = EncryptedLAPSBlob.unpack(enc_password)
@@ -1479,7 +1607,6 @@ def main() -> None:
         rpc_sign_header=sign_header,
     )
     print(f"LAPS Password: {plaintext.decode('utf-16-le')}")
-
     print(f"Plaintext hex: {base64.b16encode(plaintext).decode()}")
 
 
