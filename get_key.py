@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import hashes, keywrap
 from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
+from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash, ConcatKDFHMAC
 from cryptography.hazmat.primitives.kdf.kbkdf import KBKDFHMAC, CounterLocation, Mode
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
@@ -43,6 +43,34 @@ EMP = (uuid.UUID("e1af8308-5d1f-11c9-91a4-08002b14a0fa"), 3, 0)
 ISD_KEY = (uuid.UUID("b9785960-524f-11df-8b6d-83dcded72085"), 1, 0)
 NDR = (uuid.UUID("8a885d04-1ceb-11c9-9fe8-08002b104860"), 2, 0)
 NDR64 = (uuid.UUID("71710533-beba-4937-8319-b5dbef9ccc36"), 1, 0)
+
+KDS_SERVICE_LABEL = "KDS service\0".encode("utf-16-le")
+
+
+def _get_default_kdf_params() -> KDFParameters:
+    return KDFParameters("SHA512")
+
+
+def _get_default_secret_params() -> FFCDHParameters:
+    # RFC 5114 - 2.3. 2048-bit MODP Group with 256-bit Prime Order Subgroup
+    # https://www.rfc-editor.org/rfc/rfc5114#section-2.3
+    return FFCDHParameters(
+        key_length=256,
+        field_order=17125458317614137930196041979257577826408832324037508573393292981642667139747621778802438775238728592968344613589379932348475613503476932163166973813218698343816463289144185362912602522540494983090531497232965829536524507269848825658311420299335922295709743267508322525966773950394919257576842038771632742044142471053509850123605883815857162666917775193496157372656195558305727009891276006514000409365877218171388319923896309377791762590614311849642961380224851940460421710449368927252974870395873936387909672274883295377481008150475878590270591798350563488168080923804611822387520198054002990623911454389104774092183,
+        generator=8041367327046189302693984665026706374844608289874374425728797669509435881459140662650215832833471328470334064628508692231999401840332046192569287351991689963279656892562484773278584208040987631569628520464069532361274047374444344996651832979378318849943741662110395995778429270819222431610927356005913836932462099770076239554042855287138026806960470277326229482818003962004453764400995790974042663675692120758726145869061236443893509136147942414445551848162391468541444355707785697825741856849161233887307017428371823608125699892904960841221593344499088996021883972185241854777608212592397013510086894908468466292313,
+    )
+
+
+@dataclasses.dataclass
+class RootKey:
+    data: bytes
+    version: int = 1
+    kdf_algorithm: str = "SP800_108_CTR_HMAC"
+    kdf_parameters: KDFParameters = dataclasses.field(default_factory=_get_default_kdf_params)
+    secret_algorithm: str = "DH"
+    secret_parameters: FFCDHParameters = dataclasses.field(default_factory=_get_default_secret_params)
+    public_key_length: int = 512
+    private_key_length: int = 2048
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,6 +127,17 @@ class KDFParameters:
     # MS-GKDI - 2.2.1 KDF Parameters
     # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf#%5B%7B%22num%22%3A58%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C69%2C210%2C0%5D
 
+    def pack(self) -> bytes:
+        b_hash_name = self.hash_name.encode("utf-16-le") + b"\x00\x00"
+        return b"".join(
+            [
+                b"\x00\x00\x00\x00\x01\x00\x00\x00",
+                len(b_hash_name).to_bytes(4, byteorder="little"),
+                b"\x00\x00\x00\x00",
+                b_hash_name,
+            ]
+        )
+
     @classmethod
     def unpack(
         cls,
@@ -116,10 +155,60 @@ class KDFParameters:
 
 
 @dataclasses.dataclass(frozen=True)
+class FFCDHKey:
+    key_length: int
+    field_order: int
+    generator: int
+    public_key: bytes
+
+    @classmethod
+    def unpack(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> FFCDHKey:
+        view = memoryview(data)
+
+        assert view[:4].tobytes() == b"\x44\x48\x50\x42"
+        key_length = struct.unpack("<I", view[4:8])[0]
+
+        field_order = view[8 : 8 + key_length].tobytes()
+        assert len(field_order) == key_length
+        view = view[8 + key_length :]
+
+        generator = view[:key_length].tobytes()
+        assert len(generator) == key_length
+        view = view[key_length:]
+
+        public_key = view.tobytes()
+        assert len(public_key) == key_length
+
+        return FFCDHKey(
+            key_length=key_length,
+            field_order=int.from_bytes(field_order, byteorder="big"),
+            generator=int.from_bytes(generator, byteorder="big"),
+            public_key=public_key,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class FFCDHParameters:
     key_length: int
-    field_order: bytes
-    generator: bytes
+    field_order: int
+    generator: int
+
+    def pack(self) -> bytes:
+        b_field_order = self.field_order.to_bytes((self.field_order.bit_length() + 7) // 8, byteorder="big")
+        b_generator = self.generator.to_bytes((self.generator.bit_length() + 7) // 8, byteorder="big")
+
+        return b"".join(
+            [
+                (12 + len(b_field_order) + len(b_generator)).to_bytes(4, byteorder="little"),
+                b"\x44\x48\x50\x4D",
+                self.key_length.to_bytes(4, byteorder="little"),
+                b_field_order,
+                b_generator,
+            ]
+        )
 
     @classmethod
     def unpack(
@@ -142,8 +231,8 @@ class FFCDHParameters:
 
         return FFCDHParameters(
             key_length=key_length,
-            field_order=field_order,
-            generator=generator,
+            field_order=int.from_bytes(field_order, byteorder="big"),
+            generator=int.from_bytes(generator, byteorder="big"),
         )
 
 
@@ -309,6 +398,101 @@ class EncPasswordId:
         )
 
 
+@dataclasses.dataclass
+class GetKeyRequest:
+    opnum: int = dataclasses.field(init=False, repr=False, default=0)
+
+    target_sd: bytes
+    root_key_id: uuid.UUID
+    l0_key_id: int
+    l1_key_id: int
+    l2_key_id: int
+
+    # MS-GKDI 3.1.4.1 GetKey (Opnum 0)
+    # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/4cac87a3-521e-4918-a272-240f8fabed39
+    # HRESULT GetKey(
+    #     [in] handle_t hBinding,
+    #     [in] ULONG cbTargetSD,
+    #     [in] [size_is(cbTargetSD)] [ref] char* pbTargetSD,
+    #     [in] [unique] GUID* pRootKeyID,
+    #     [in] LONG L0KeyID,
+    #     [in] LONG L1KeyID,
+    #     [in] LONG L2KeyID,
+    #     [out] unsigned long* pcbOut,
+    #     [out] [size_is(, *pcbOut)] byte** ppbOut);
+
+    def pack(self) -> bytes:
+        # Strictly speaking it is only 4 bytes but NDR64 needs 8 byte alignment
+        # on the field after.
+        target_sd_len = len(self.target_sd).to_bytes(8, byteorder="little")
+
+        return b"".join(
+            [
+                # cbTargetSD
+                target_sd_len,
+                # pbTargetSD - pointer header includes the length + padding
+                target_sd_len,
+                self.target_sd,
+                b"\x00" * (-len(self.target_sd) % 8),
+                # pRootKeyID - includes referent id
+                b"\x00\x00\x02\x00\x00\x00\x00\x00",
+                self.root_key_id.bytes_le,
+                # L0KeyID
+                self.l0_key_id.to_bytes(4, byteorder="little", signed=True),
+                # L1KeyID
+                self.l1_key_id.to_bytes(4, byteorder="little", signed=True),
+                # L2KeyID
+                self.l2_key_id.to_bytes(4, byteorder="little", signed=True),
+            ]
+        )
+
+    @classmethod
+    def unpack(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> GetKeyRequest:
+        view = memoryview(data)
+
+        target_sd_len = struct.unpack("<I", view[:4])[0]
+        target_sd = view[16 : 16 + target_sd_len].tobytes()
+        padding = -target_sd_len % 8
+
+        view = view[24 + target_sd_len + padding :]
+        root_key_id = uuid.UUID(bytes_le=view[:16].tobytes())
+        l0_key_id = struct.unpack("<i", view[16:20])[0]
+        l1_key_id = struct.unpack("<i", view[20:24])[0]
+        l2_key_id = struct.unpack("<i", view[24:28])[0]
+
+        return GetKeyRequest(
+            target_sd=target_sd,
+            root_key_id=root_key_id,
+            l0_key_id=l0_key_id,
+            l1_key_id=l1_key_id,
+            l2_key_id=l2_key_id,
+        )
+
+    @classmethod
+    def unpack_response(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> GroupKeyEnvelope:
+        view = memoryview(data)
+
+        hresult = struct.unpack("<I", view[-4:].tobytes())[0]
+        view = view[:-4]
+        if hresult != 0:
+            raise Exception(f"GetKey failed 0x{hresult:08X}")
+
+        key_length = struct.unpack("<I", view[:4])[0]
+        view = view[8:]  # Skip padding as well
+        # Skip the referent id and double up on pointer size
+        key = view[16 : 16 + key_length].tobytes()
+        assert len(key) == key_length
+        # print(f"GetKey Response: {base64.b16encode(data).decode()}")
+
+        return GroupKeyEnvelope.unpack(key)
+
+
 def get_laps_enc_password(dc: str, server: str) -> bytes:
     with socket.create_connection((dc, 389)) as s:
         ctx = spnego.client(hostname=dc, service="ldap")
@@ -403,37 +587,52 @@ def sd_to_bytes(
 ) -> bytes:
     control = 0b10000000 << 8  # Self-Relative
 
-    owner_sid = sid_to_bytes(owner)
-    group_sid = sid_to_bytes(group)
+    # While MS-DTYP state there is no required order for the dynamic data, it
+    # is important that the raw bytes are exactly what Microsoft uses on the
+    # server side when it computes the seed key values. Luckily the footnote
+    # give the correct order the MS-GKDI expects: Sacl, Dacl, Owner, Group
+    # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/11e1608c-6169-4fbc-9c33-373fc9b224f4#Appendix_A_72
+    dynamic_data = bytearray()
+    current_offset = 20  # Length of the SD header bytes
 
-    b_sacl = b""
+    sacl_offset = 0
     if sacl:
+        sacl_bytes = acl_to_bytes(sacl)
+        sacl_offset = current_offset
+        current_offset += len(sacl_bytes)
+
         control |= 0b00010000  # SACL Present
-        b_sacl = acl_to_bytes(sacl)
+        dynamic_data += sacl_bytes
 
-    b_dacl = b""
+    dacl_offset = 0
     if dacl:
+        dacl_bytes = acl_to_bytes(dacl)
+        dacl_offset = current_offset
+        current_offset += len(dacl_bytes)
+
         control |= 0b00000100  # DACL Present
-        b_dacl = acl_to_bytes(dacl)
+        dynamic_data += dacl_bytes
 
-    data = bytearray()
+    owner_bytes = sid_to_bytes(owner)
+    owner_offset = current_offset
+    current_offset += len(owner_bytes)
+    dynamic_data += owner_bytes
 
-    offset = 20
-    data += struct.pack("B", 1)  # Revision
-    data += struct.pack("B", 0)  # Sbz1
-    data += struct.pack("<H", control)
-    data += struct.pack("<I", offset)
-    offset += len(owner_sid)
-    data += struct.pack("<I", offset)
-    offset += len(group_sid)
-    data += struct.pack("<I", offset if b_sacl else 0)
-    offset += len(b_sacl)
-    data += struct.pack("<I", offset if b_dacl else 0)
-    offset += len(b_dacl)
+    group_bytes = sid_to_bytes(group)
+    group_offset = current_offset
+    dynamic_data += group_bytes
 
-    data += owner_sid + group_sid + b_sacl + b_dacl
-
-    return bytes(data)
+    return b"".join(
+        [
+            b"\x01\x00",  # Revision and Sbz1
+            control.to_bytes(2, byteorder="little"),
+            owner_offset.to_bytes(4, byteorder="little"),
+            group_offset.to_bytes(4, byteorder="little"),
+            sacl_offset.to_bytes(4, byteorder="little"),
+            dacl_offset.to_bytes(4, byteorder="little"),
+            dynamic_data,
+        ]
+    )
 
 
 def create_pdu(
@@ -753,84 +952,6 @@ def parse_response(
         return stub_data.tobytes()
 
 
-def create_get_key_request(
-    target_sd: bytes,
-    root_key_id: uuid.UUID,
-    l0: int,
-    l1: int,
-    l2: int,
-) -> t.Tuple[int, bytes]:
-    # HRESULT GetKey(
-    #     [in] handle_t hBinding,
-    #     [in] ULONG cbTargetSD,
-    #     [in] [size_is(cbTargetSD)] [ref] char* pbTargetSD,
-    #     [in] [unique] GUID* pRootKeyID,
-    #     [in] LONG L0KeyID,
-    #     [in] LONG L1KeyID,
-    #     [in] LONG L2KeyID,
-    #     [out] unsigned long* pcbOut,
-    #     [out] [size_is(, *pcbOut)] byte** ppbOut);
-
-    target_sd_len = struct.pack("<I", len(target_sd))
-
-    data = bytearray()
-
-    # cbTargetSD
-    data += target_sd_len
-    data += b"\x00\x00\x00\x00"  # I think padding for 8 byte boundary align?
-
-    # pbTargetSD
-    # A pointer seems to include the length + 8 byte alignment padding before
-    # the value
-    data += target_sd_len
-    data += b"\x00\x00\x00\x00"
-    data += target_sd
-    target_sd_padding = -len(target_sd) % 8
-    data += b"\x00" * target_sd_padding
-
-    # pRootKeyID
-    data += b"\x00\x00\x02\x00\x00\x00\x00\x00"  # Maybe Referent ID?
-    data += root_key_id.bytes_le
-
-    # L0KeyID
-    data += struct.pack("<I", l0)
-
-    # L1KeyID
-    data += struct.pack("<I", l1)
-
-    # L2KeyID
-    data += struct.pack("<I", l2)
-
-    return 0, bytes(data)
-
-
-def parse_create_key_response(data: bytes) -> GroupKeyEnvelope:
-    # HRESULT GetKey(
-    #     [in] handle_t hBinding,
-    #     [in] ULONG cbTargetSD,
-    #     [in] [size_is(cbTargetSD)] [ref] char* pbTargetSD,
-    #     [in] [unique] GUID* pRootKeyID,
-    #     [in] LONG L0KeyID,
-    #     [in] LONG L1KeyID,
-    #     [in] LONG L2KeyID,
-    #     [out] unsigned long* pcbOut,
-    #     [out] [size_is(, *pcbOut)] byte** ppbOut);
-    view = memoryview(data)
-
-    hresult = struct.unpack("<I", view[-4:].tobytes())[0]
-    view = view[:-4]
-    if hresult != 0:
-        raise Exception(f"GetKey failed 0x{hresult:08X}")
-
-    key_length = struct.unpack("<I", view[:4])[0]
-    view = view[8:]  # Skip padding as well
-    # Skip the reference id and double up on pointer size
-    key = view[16 : 16 + key_length].tobytes()
-    assert len(key) == key_length
-
-    return GroupKeyEnvelope.unpack(key)
-
-
 def create_ept_map_request(
     service: t.Tuple[uuid.UUID, int, int],
     data_rep: t.Tuple[uuid.UUID, int, int],
@@ -975,6 +1096,75 @@ def parse_ept_map_response(data: bytes) -> t.List[Tower]:
     return towers
 
 
+def generate_l1_seed_key(
+    target_sd: bytes,
+    root_key_id: uuid.UUID,
+    l0: int,
+    root_key: RootKey,
+) -> GroupKeyEnvelope:
+    hash_algo: hashes.HashAlgorithm
+    if root_key.kdf_parameters.hash_name == "SHA1":
+        hash_algo = hashes.SHA512()
+    elif root_key.kdf_parameters.hash_name == "SHA256":
+        hash_algo = hashes.SHA256()
+    elif root_key.kdf_parameters.hash_name == "SHA384":
+        hash_algo = hashes.SHA384()
+    elif root_key.kdf_parameters.hash_name == "SHA512":
+        hash_algo = hashes.SHA512()
+    else:
+        raise NotImplementedError(f"Unsupported hash algorithm {root_key.kdf_parameters.hash_name}")
+
+    # Note: 512 is number of bits, we use byte length here
+    # Key(SD, RK, L0, -1, -1) = KDF(
+    #   HashAlg,
+    #   RK.msKds-RootKeyData,
+    #   "KDS service",
+    #   RKID || L0 || 0xffffffff || 0xffffffff,
+    #   512
+    # )
+    l0_seed = kdf(
+        hash_algo,
+        root_key.data,
+        KDS_SERVICE_LABEL,
+        compute_kdf_context(root_key_id, l0, -1, -1),
+        64,
+    )
+
+    # Key(SD, RK, L0, 31, -1) = KDF(
+    #   HashAlg,
+    #   Key(SD, RK, L0, -1, -1),
+    #   "KDS service",
+    #   RKID || L0 || 31 || 0xffffffff || SD,
+    #   512
+    # )
+    l1_seed = kdf(
+        hash_algo,
+        l0_seed,
+        KDS_SERVICE_LABEL,
+        compute_kdf_context(root_key_id, l0, 31, -1) + target_sd,
+        64,
+    )
+
+    return GroupKeyEnvelope(
+        version=1,
+        flags=2,
+        l0=l0,
+        l1=31,
+        l2=31,
+        root_key_identifier=root_key_id,
+        kdf_algorithm=root_key.kdf_algorithm,
+        kdf_parameters=root_key.kdf_parameters.pack(),
+        secret_algorithm=root_key.secret_algorithm,
+        secret_parameters=root_key.secret_parameters.pack(),
+        private_key_length=root_key.private_key_length,
+        public_key_length=root_key.public_key_length,
+        domain_name="",
+        forest_name="",
+        l1_key=l1_seed,
+        l2_key=b"",
+    )
+
+
 def get_key(
     dc: str,
     target_sd: bytes,
@@ -1067,10 +1257,10 @@ def get_key(
         assert not out_token
         # TODO: Deal with a no header signing.from server
 
-        opnum, get_key_req = create_get_key_request(target_sd, root_key_id, l0, l1, l2)
+        get_key_req = GetKeyRequest(target_sd, root_key_id, l0, l1, l2)
         request = create_request(
-            opnum,
-            get_key_req,
+            get_key_req.opnum,
+            get_key_req.pack(),
             ctx=ctx,
             sign_header=sign_header,
         )
@@ -1078,7 +1268,7 @@ def get_key(
         resp = s.recv(4096)
 
         create_key_resp = parse_response(resp, ctx=ctx, sign_header=sign_header)
-        return parse_create_key_response(create_key_resp)
+        return GetKeyRequest.unpack_response(create_key_resp)
 
 
 def aes256gcm_decrypt(
@@ -1104,9 +1294,6 @@ def compute_kdf_context(
     l1: int,
     l2: int,
 ) -> bytes:
-    # The MS-GKDI docs state this is just 'Key(SD, RK, L0, L1, L2)' but don't
-    # mention how they are all joined together. GoldenGMSA only uses
-    # (RK, L0, L1, K2) concatenated together. Probably needs more investigation.
     context = key_guid.bytes_le
     context += struct.pack("<i", l0)
     context += struct.pack("<i", l1)
@@ -1162,10 +1349,82 @@ def parse_dpapi_ng_blob(data: bytes) -> t.Tuple[KEKRecipientInfo, EncryptedConte
     return enveloped_data.recipient_infos[0], enc_content
 
 
+def compute_l2_key(
+    algorithm: hashes.HashAlgorithm,
+    request: EncPasswordId,
+    rk: GroupKeyEnvelope,
+) -> bytes:
+    l1 = rk.l1
+    l1_key = rk.l1_key
+    l2 = rk.l2
+    l2_key = rk.l2_key
+    reseed_l2 = rk.l1 != request.l1
+
+    # MS-GKDI 2.2.4 Group key Envelope
+    # If the value in the L2 index field is equal to 31, this contains the
+    # L1 key with group key identifier (L0 index, L1 index, -1). In all
+    # other cases, this field contains the L1 key with group key identifier
+    # (L0 index, L1 index - 1, -1). If this field is present, its length
+    # MUST be equal to 64 bytes.
+    if l2 != 31 and l1 != request.l1:
+        l1 -= 1
+
+    while l1 != request.l1:
+        reseed_l2 = True
+        l1 -= 1
+
+        l1_key = kdf(
+            algorithm,
+            l1_key,
+            KDS_SERVICE_LABEL,
+            compute_kdf_context(
+                rk.root_key_identifier,
+                rk.l0,
+                l1,
+                -1,
+            ),
+            64,
+        )
+
+    if reseed_l2:
+        l2 = 31
+        l2_key = kdf(
+            algorithm,
+            l1_key,
+            KDS_SERVICE_LABEL,
+            compute_kdf_context(
+                rk.root_key_identifier,
+                rk.l0,
+                l1,
+                l2,
+            ),
+            64,
+        )
+
+    while l2 != request.l2:
+        l2 -= 1
+
+        l2_key = kdf(
+            algorithm,
+            l2_key,
+            KDS_SERVICE_LABEL,
+            compute_kdf_context(
+                rk.root_key_identifier,
+                rk.l0,
+                l1,
+                l2,
+            ),
+            64,
+        )
+
+    return l2_key
+
+
 def ncrypt_unprotect_secret(
     dc: str,
     blob: bytes,
     rpc_sign_header: bool = True,
+    root_key: t.Optional[RootKey] = None,
 ) -> bytes:
     kek_info, enc_content = parse_dpapi_ng_blob(blob)
 
@@ -1189,85 +1448,28 @@ def ncrypt_unprotect_secret(
         dacl=[ace_to_bytes(protection_descriptor.value, 3), ace_to_bytes("S-1-1-0", 2)],
     )
 
-    rk = get_key(
-        dc,
-        target_sd,
-        password_id.root_key_identifier,
-        password_id.l0,
-        password_id.l1,
-        password_id.l2,
-        sign_header=rpc_sign_header,
-    )
-
-    # Now we have the key info we should be able to decrypt the original
-    # payload.
-    # Maybe GoldenGMSA has more info.
-    # Will need to look in CQURE and their PFX decryption which seems very
-    # closely related to this
-    # https://www.semperis.com/blog/golden-gmsa-attack/
-    # https://cqureacademy.com/blog/secure-server/understand-credential-security-notes-session-microsoft-ignite
-    #
-    # A snapshot of the information know at this point in time.
-    # msLAPS-EncryptedPassword payload
-    #   recipient info
-    #       kek_algo: 2.16.840.1.101.3.4.1.45 (AES256 wrap) - no params
-    #       enc_key: 192ABFD9C2C20563673768C56B3C9A8C049C2DF7C5CE39EFD315A944DB62C229F47F92B0CCB59CA8
-    #       kekid_pub_key: 444850420001000087A8E61DB4B6663CFFBBD19C651959998CEEF608660DD0F25D2CEED4435E3B00E00DF8F1D61957D4FAF7DF4561B2AA3016C3D91134096FAA3BF4296D830E9A7C209E0C6497517ABD5A8A9D306BCF67ED91F9E6725B4758C022E0B1EF4275BF7B6C5BFC11D45F9088B941F54EB1E59BB8BC39A0BF12307F5C4FDB70C581B23F76B63ACAE1CAA6B7902D52526735488A0EF13C6D9A51BFA4AB3AD8347796524D8EF6A167B5A41825D967E144E5140564251CCACB83E6B486F6B3CA3F7971506026C0B857F689962856DED4010ABD0BE621C3A3960A54E710C375F26375D7014103A4B54330C198AF126116D2276E11715F693877FAD7EF09CADB094AE91E1A15973FB32C9B73134D0B2E77506660EDBD484CA7B18F21EF205407F4793A1A0BA12510DBC15077BE463FFF4FED4AAC0BB555BE3A6C1B0C6B47B1BC3773BF7E8C6F62901228F8C28CBB18A55AE31341000A650196F931C77A57F2DDF463E5E9EC144B777DE62AAAB8A8628AC376D282D6ED3864E67982428EBC831D14348F6F2F9193B5045AF2767164E1DFC967C1FB3F2E55A4BD1BFFE83B9C80D052B985D182EA0ADB2A3B7313D3FE14C8484B1E052588B9B7D2BBD2DF016199ECD06E1557CD0915B3353BBB64E0EC377FD028370DF92B52C7891428CDC67EB6184B523D1DB246C32F63078490F00EF8D647D148D47954515E2327CFEF98C582664B4C0F6CC416594B54EA70598A6B5F120AEF7C1F091E304344E04A3C377CFF591623B9BC1A1D67CC573BA93D66B3760E7976B750A2CFBDB6CBA9D3F76B5C8CD630786E8D32A3EEA8DC0940D367361F5941BA94F6A97DB5DCB7F25E97B57066E420E3CBB478B6980718AF7B5DF668AC9D61A09D958FA8FFD7ED3AC849C94E88FDB2D45AE9B87BFD983CD7A30ACF46D1D60490194EB44B0674F8D9E7360E7088725E1B4870FD24C74E4F84A1364787787DEC2D952040E77A71D8EE530D1D33144B4D4074EF5D3604541C280A7EFDCB00AB4BB99B56255DBBFC96BB069C65C793614C6B2782C768E4CADE53841958F8DE0D669E747F50E8355B093702E8F594B8B1DFE2D9A17C8B0B
-    #   encrypted content info
-    #       content_algorithm: 2.16.840.1.101.3.4.1.46 (AES256 GCM) - 3011040C7CAAA06665D7D747E912A6C7020110
-    #           nonce: 7CAAA06665D7D747E912A6C7
-    #           icvlen: 16
-    #
-    # GetKey result
-    #   kdf_algo - 'SP800_108_CTR_HMAC'
-    #   kdf_parameters - 00000000010000000E000000000000005300480041003500310032000000
-    #       https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf - 2.2.1 KDF Parameters
-    #       name - SHA512
-    #   l1_key - F029FC8D8FD0509E69F9FE40A1D54A374552101F291819307F800BA8DE21437F062F5104BBD19E4DDB747FD9C48B7C63838BE17B12227C221287BBE05DD13C49
-    #   l2_key - 8EB901182619306ECADD3003CCAE623677A6B86FB3FBA5488BCA0F16AE202870D75512A76F7FB31A6C523F301C6B35B26CB0184284C346379F9224EB9EB423FA
-    #   secret_algorithm - DH
-    #   secret_parameters - 0C0200004448504D0001000087A8E61DB4B6663CFFBBD19C651959998CEEF608660DD0F25D2CEED4435E3B00E00DF8F1D61957D4FAF7DF4561B2AA3016C3D91134096FAA3BF4296D830E9A7C209E0C6497517ABD5A8A9D306BCF67ED91F9E6725B4758C022E0B1EF4275BF7B6C5BFC11D45F9088B941F54EB1E59BB8BC39A0BF12307F5C4FDB70C581B23F76B63ACAE1CAA6B7902D52526735488A0EF13C6D9A51BFA4AB3AD8347796524D8EF6A167B5A41825D967E144E5140564251CCACB83E6B486F6B3CA3F7971506026C0B857F689962856DED4010ABD0BE621C3A3960A54E710C375F26375D7014103A4B54330C198AF126116D2276E11715F693877FAD7EF09CADB094AE91E1A15973FB32C9B73134D0B2E77506660EDBD484CA7B18F21EF205407F4793A1A0BA12510DBC15077BE463FFF4FED4AAC0BB555BE3A6C1B0C6B47B1BC3773BF7E8C6F62901228F8C28CBB18A55AE31341000A650196F931C77A57F2DDF463E5E9EC144B777DE62AAAB8A8628AC376D282D6ED3864E67982428EBC831D14348F6F2F9193B5045AF2767164E1DFC967C1FB3F2E55A4BD1BFFE83B9C80D052B985D182EA0ADB2A3B7313D3FE14C8484B1E052588B9B7D2BBD2DF016199ECD06E1557CD0915B3353BBB64E0EC377FD028370DF92B52C7891428CDC67EB6184B523D1DB246C32F63078490F00EF8D647D148D47954515E2327CFEF98C582664B4C0F6CC41659
-    #       https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf - 2.2.2 FCC DH Parameters
-    #       key_length - 256
-    #       field_order - 87A8E61DB4B6663CFFBBD19C651959998CEEF608660DD0F25D2CEED4435E3B00E00DF8F1D61957D4FAF7DF4561B2AA3016C3D91134096FAA3BF4296D830E9A7C209E0C6497517ABD5A8A9D306BCF67ED91F9E6725B4758C022E0B1EF4275BF7B6C5BFC11D45F9088B941F54EB1E59BB8BC39A0BF12307F5C4FDB70C581B23F76B63ACAE1CAA6B7902D52526735488A0EF13C6D9A51BFA4AB3AD8347796524D8EF6A167B5A41825D967E144E5140564251CCACB83E6B486F6B3CA3F7971506026C0B857F689962856DED4010ABD0BE621C3A3960A54E710C375F26375D7014103A4B54330C198AF126116D2276E11715F693877FAD7EF09CADB094AE91E1A1597
-    #       generator - 3FB32C9B73134D0B2E77506660EDBD484CA7B18F21EF205407F4793A1A0BA12510DBC15077BE463FFF4FED4AAC0BB555BE3A6C1B0C6B47B1BC3773BF7E8C6F62901228F8C28CBB18A55AE31341000A650196F931C77A57F2DDF463E5E9EC144B777DE62AAAB8A8628AC376D282D6ED3864E67982428EBC831D14348F6F2F9193B5045AF2767164E1DFC967C1FB3F2E55A4BD1BFFE83B9C80D052B985D182EA0ADB2A3B7313D3FE14C8484B1E052588B9B7D2BBD2DF016199ECD06E1557CD0915B3353BBB64E0EC377FD028370DF92B52C7891428CDC67EB6184B523D1DB246C32F63078490F00EF8D647D148D47954515E2327CFEF98C582664B4C0F6CC41659
-    #
-    # Actual Password
-    #   5{Bb}B,})1(!B3
-
-    # CQURE states for PFX decryption this is used but it doesn't go into more
-    # details. Maybe try and get a copy of 'CQDPAPINGPFXDecrypter.exe'
-    # DPAPI-NG
-    # A. RootKey
-    # Algorithms
-    # Key derivation function: SP800_108_CTR_HMAC (SHA512)
-    # Secret agreement: Diffie-Hellman
-
-    # B. DPAPI blob
-    # Key derivation: KDF_SP80056A_CONCAT
-
-    # After getting the key, there is a need for decryption:
-    # Key wrap algorithm: RFC3394 (KEK -> CEK)
-    # Decryption: AES-256-GCM (CEK, Blob)
-
-    # From MS there is this diagram
-    # https://learn.microsoft.com/en-us/windows/win32/seccng/protected-data-format
-    # Protected data is stored as an ASN.1 encoded BLOB. The data is formatted
-    # as CMS (certificate message syntax) enveloped content. The digital
-    # envelope contains encrypted content, recipient information that contains
-    # an encrypted content encryption key (CEK), and a header that contains
-    # information about the content, including the unencrypted protection
-    # descriptor rule string.
-
-    # This is not right and just me spitballing trying to figure things out.
-    # MS-GKDI 3.1.4.1.2 Generating a Group Key
-    # https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-GKDI/%5bMS-GKDI%5d.pdf#%5B%7B%22num%22%3A91%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C69%2C557%2C0%5D
-    # print(f"PasswordId L0 {password_id.l0} L1 {password_id.l1} L2 {password_id.l2}")
-    # print(f"GroupKeyId L0 {rk.l0} L1 {rk.l1} L2 {rk.l2}")
-    label = "KDS service\0".encode("utf-16-le")
+    if root_key:
+        rk = generate_l1_seed_key(
+            target_sd,
+            password_id.root_key_identifier,
+            password_id.l0,
+            root_key,
+        )
+    else:
+        rk = get_key(
+            dc,
+            target_sd,
+            password_id.root_key_identifier,
+            password_id.l0,
+            password_id.l1,
+            password_id.l2,
+            sign_header=rpc_sign_header,
+        )
 
     assert rk.version == 1
+    assert not rk.is_public_key
     assert rk.kdf_algorithm == "SP800_108_CTR_HMAC"
+    assert rk.l0 == password_id.l0
 
     kdf_parameters = KDFParameters.unpack(rk.kdf_parameters)
     hash_algo: hashes.HashAlgorithm
@@ -1282,235 +1484,163 @@ def ncrypt_unprotect_secret(
     else:
         raise Exception(f"Unsupported hash algorithm {kdf_parameters.hash_name}")
 
-    # TODO: Deal with L0 differences.
-    l1 = rk.l1
-    l1_key = rk.l1_key
-    l2 = rk.l2
-    l2_key = rk.l2_key
+    l2_key = compute_l2_key(hash_algo, password_id, rk)
 
-    if password_id.l1 != l1:
-        l1 = rk.l1 - 1
+    if password_id.is_public_key:
+        # MS-GKDI - 3.1.4.1.2 Generating a Group key
+        # To derive a group public key with a group key identifier (L0, L1, L2),
+        # the server MUST proceed as follows:
+        # First, the server MUST validate the root key configuration attributes
+        # related to public keys
 
-        while password_id.l1 != l1:
-            l1 -= 1
-            l1_key = kdf(
-                hash_algo,
-                l1_key,
-                label,
-                compute_kdf_context(
-                    rk.root_key_identifier,
-                    rk.l0,
-                    l1,
-                    -1,
-                ),
-                64,
-            )
+        # DH
+        # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH",
+        # RK.msKds-SecretAgreement-Param MUST be in the format specified in section
+        # 2.2.2, and the Key length field of RK.msKds-SecretAgreement-Param MUST be
+        # equal to RK.msKds-PublicKey-Length
 
-        l2 = 31
-        l2_key = kdf(
-            hash_algo,
-            l1_key,
-            label,
-            compute_kdf_context(
-                rk.root_key_identifier,
-                rk.l0,
-                l1,
-                l2,
-            ),
-            64,
-        )
+        # TODO: Support ECHD keys
+        assert rk.secret_algorithm == "DH"
+        dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
+        assert dh_parameters.key_length == (rk.public_key_length // 8)
 
-    while l2 != password_id.l2:
-        l2 -= 1
-
-        # Key(SD, RK, L0, L1, n) = KDF(
+        # 2. Having validated the root key configuration, the server MUST then
+        # compute the group private key in the following manner:
+        # PrivKey(SD, RK, L0, L1, L2) = KDF(
         #   HashAlg,
-        #   Key(SD, RK, L0, L1, n+1),
+        #   Key(SD, RK, L0, L1, L2),
         #   "KDS service",
-        #   RKID || L0 || L1 || n,
-        #   512
+        #   RK.msKds-SecretAgreement-AlgorithmID,
+        #   RK.msKds-PrivateKey-Length
         # )
-        l2_key = kdf(
+        private_key = kdf(
             hash_algo,
             l2_key,
-            label,
-            compute_kdf_context(
-                rk.root_key_identifier,
-                rk.l0,
-                l1,
-                l2,
-            ),
-            64,
+            KDS_SERVICE_LABEL,
+            (rk.secret_algorithm + "\0").encode("utf-16-le"),
+            math.ceil(rk.private_key_length / 8),
         )
 
-    # MS-GKDI - 3.1.4.1.2 Generating a Group key
-    # To derive a group public key with a group key identifier (L0, L1, L2),
-    # the server MUST proceed as follows:
-    # First, the server MUST validate the root key configuration attributes
-    # related to public keys
+        expected_priv_key = base64.b16decode(
+            "6DA51A773F9E205700991BCAF3C23BF03257EDBED5EEBC14C7961C7B0C9C1D2C4BBE9607F61BBB59AB83E466CEF4FF60527407694A1306DCB0776788A1FB6429"
+        )
+        assert (
+            private_key == expected_priv_key
+        ), f"Private key mismatch\n{base64.b16encode(private_key).decode()}\n{base64.b16encode(expected_priv_key).decode()}"
 
-    # DH
-    # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH",
-    # RK.msKds-SecretAgreement-Param MUST be in the format specified in section
-    # 2.2.2, and the Key length field of RK.msKds-SecretAgreement-Param MUST be
-    # equal to RK.msKds-PublicKey-Length
+        # 3. Lastly, the server MUST compute the group public key
+        # PubKey(SD, RK, L0, L1, L2) as follows:
 
-    # TODO: Support ECHD keys
-    assert rk.secret_algorithm == "DH"
-    dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
-    assert dh_parameters.key_length == (rk.public_key_length // 8)
+        # Test case
+        # P = b"\x0D"  # 13
+        # G = b"\x06"
+        # a = b"\x05"
+        # b = b"\x04"
+        # A = b"\x02"
+        # B = b"\x09"
+        # s = b"\x03"
 
-    # 2. Having validated the root key configuration, the server MUST then
-    # compute the group private key in the following manner:
-    # PrivKey(SD, RK, L0, L1, L2) = KDF(
-    #   HashAlg,
-    #   Key(SD, RK, L0, L1, L2),
-    #   "KDS service",
-    #   RK.msKds-SecretAgreement-AlgorithmID,
-    #   RK.msKds-PrivateKey-Length
-    # )
-    private_key = kdf(
-        hash_algo,
-        l2_key,
-        label,
-        (rk.secret_algorithm + "\0").encode("utf-16-le"),
-        math.ceil(rk.private_key_length / 8),
-    )
+        # actual = get_dh_pub(P, G, a)
+        # assert actual == A
 
-    # 3. Lastly, the server MUST compute the group public key
-    # PubKey(SD, RK, L0, L1, L2) as follows:
+        # actual = get_dh_pub(P, G, b)
+        # assert actual == B
 
-    # Test case
-    # P = b"\x0D"  # 13
-    # G = b"\x06"
-    # a = b"\x05"
-    # b = b"\x04"
-    # A = b"\x02"
-    # B = b"\x09"
-    # s = b"\x03"
+        # actual = get_dh_shared_secret(P, a, B)
+        # assert actual == s
 
-    # actual = get_dh_pub(P, G, a)
-    # assert actual == A
+        # actual = get_dh_shared_secret(P, b, A)
+        # assert actual == s
 
-    # actual = get_dh_pub(P, G, b)
-    # assert actual == B
+        # DH
+        # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH", the server MUST
+        # compute PubKey(SD, RK, L0, L1, L2) by using the method specified in
+        # [SP800-56A] section 5.6.1.1, with the group parameters specified in
+        # RK.msKds-SecretAgreement-Param, and with PrivKey(SD, RK, L0, L1, L2) as
+        # the private key
+        # public_key = get_dh_pub(dh_parameters.field_order, dh_parameters.generator, private_key)
 
-    # actual = get_dh_shared_secret(P, a, B)
-    # assert actual == s
+        # TODO: Support ECHD keys
 
-    # actual = get_dh_shared_secret(P, b, A)
-    # assert actual == s
+        # With the private and public key we can derive the shared secret
+        # This isn't right we only have our private and public key. We need the
+        # peer's public key for this.
+        public_key = FFCDHKey.unpack(password_id.unknown)
+        shared_secret = get_dh_shared_secret(dh_parameters.field_order, private_key, public_key.public_key)
 
-    # DH
-    # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH", the server MUST
-    # compute PubKey(SD, RK, L0, L1, L2) by using the method specified in
-    # [SP800-56A] section 5.6.1.1, with the group parameters specified in
-    # RK.msKds-SecretAgreement-Param, and with PrivKey(SD, RK, L0, L1, L2) as
-    # the private key
-    public_key = get_dh_pub(dh_parameters.field_order, dh_parameters.generator, private_key)
+        kds_public_key = "KDS public key\0".encode("utf-16-le")
+        otherinfo = kdf_parameters.hash_name.encode("utf-16-le") + kds_public_key + KDS_SERVICE_LABEL
+        # otherinfo = kds_public_key + KDS_SERVICE_LABEL
+        concat_agreement = ConcatKDFHash(hash_algo, length=32, otherinfo=otherinfo).derive(shared_secret)
 
-    # TODO: Support ECHD keys
+        expected_concat_agreement = base64.b16decode("EF2B290FDFC8F4D4E2BD55CF1B6F565254F73DFAE3CDA2715485220B128F9792")
+        assert (
+            concat_agreement == expected_concat_agreement
+        ), f"Concat agreement mismatch\n{base64.b16encode(concat_agreement).decode()}\n{base64.b16encode(expected_concat_agreement).decode()}"
 
-    # With the private and public key we can derive the shared secret
-    # This isn't right we only have our private and public key. We need the
-    # peer's public key for this.
-    # shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, public_key)
-    # shared_secret = get_dh_shared_secret(dh_parameters.generator, private_key, password_id.unknown)
+        kek = kdf(
+            hash_algo,
+            concat_agreement,
+            KDS_SERVICE_LABEL,
+            kds_public_key,
+            32,
+        )
 
-    # Manual run from Windows and their results
-    """
-BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE6A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69390, SecretLength: 64, Flags: 0x00000000) -> Secret: 47D6429C3531529118726E7CAB366777CB4388BA0F6E160A75D7432A1F47FC2BB9F385E90E5393990A352D481907E540A91EDB10BEF4EAACC90F7CFA5446966F
+        expected_kek = base64.b16decode("E4AB33925FAB1FF09AB43FDD4B83F1E449F95EE93ECF92C48AE404482CE755AA")
+        assert (
+            kek == expected_kek
+        ), f"KEK mismatch\n{base64.b16encode(kek).decode()}\n{base64.b16encode(expected_kek).decode()}"
+
+        """
+# l2_key
+BCryptGenerateSymmetricKey(Algorithm: 0x1C8A1CC0DF0, Key: 0x38230BE5B0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2093AFB3A10, SecretLength: 64, Flags: 0x00000000)
+        Secret: 44900E2CC9BC8E702D594AA63B59F04D365CAFC1590FDEAD37EDA62BB083F49B05DEA0A82BD65C863173E9B3638CB2002F8D21520D2D3C55659022A9EAFB06A1
 BCryptGenerateSymmetricKey -> Res: 0x00000000
 
-BCryptKeyDerivation(Key: 0x2DB52AFBBC0, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69390, DerivedKeyLength: 64, OutKeyLength: 0xB97DAFE694, Flags: 0x00000000)
+BCryptKeyDerivation(Key: 0x1C8A26E20C0, ParameterList: 0x2093ADFD3D0, DerivedKey: 0x2093AFB3A10, DerivedKeyLength: 64, OutKeyLength: 0x38230BE5A4, Flags: 0x00000000)
         BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
                 [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000A84FC6BA90E87C91109083E7B0F85996690100000F0000001F000000
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000440048000000
                         Label: KDS service
-                        Context: A84FC6BA90E87C91109083E7B0F85996690100000F0000001F000000
-                                RootKeyId: 168 79 198 186 144 232 124 145 16 144 131 231 176 248 89 150
-                                L0: 361
-                                L1: 15
-                                L2: 31
-BCryptKeyDerivation -> Res: 0x00000000, Derived: E8538AF97E87306C9CE2E327905EB932220E76DA3946E94AB26A9748206F927F0324A7024C3596E76ADA8E68FE3A592FA80446956F58238532A3434F0B5C1B38, A: 0x2DB52F69390
+                        Context: 440048000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: 6DA51A773F9E205700991BCAF3C23BF03257EDBED5EEBC14C7961C7B0C9C1D2C4BBE9607F61BBB59AB83E466CEF4FF60527407694A1306DCB0776788A1FB6429
 
-BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE6A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69390, SecretLength: 64, Flags: 0x00000000) -> Secret: E8538AF97E87306C9CE2E327905EB932220E76DA3946E94AB26A9748206F927F0324A7024C3596E76ADA8E68FE3A592FA80446956F58238532A3434F0B5C1B38
-BCryptGenerateSymmetricKey -> Res: 0x00000000
+BCryptDeriveKey(SharedSecret: 0x2093AC41E20, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0x38230BE680, DerivedKey: 0x00000000, DerivedKeyLength: 0, OutKeyLength: 0x38230BE670, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
+                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
+                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
+                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: 0000000000000000000000000000000000000000000000000000000000000000
 
-BCryptKeyDerivation(Key: 0x2DB52AFB380, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69390, DerivedKeyLength: 64, OutKeyLength: 0xB97DAFE694, Flags: 0x00000000)
+BCryptDeriveKey(SharedSecret: 0x2093AC41E20, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0x38230BE680, DerivedKey: 0x2093AF51340, DerivedKeyLength: 32, OutKeyLength: 0x38230BE670, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
+                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
+                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
+                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: EF2B290FDFC8F4D4E2BD55CF1B6F565254F73DFAE3CDA2715485220B128F9792
+
+BCryptKeyDerivation(Key: 0x1C8A26E15C0, ParameterList: 0x2093AFC6D30, DerivedKey: 0x2093AC7EEA0, DerivedKeyLength: 32, OutKeyLength: 0x38230BE5A4, Flags: 0x00000000)
         BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
                 [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000A84FC6BA90E87C91109083E7B0F85996690100000F0000001E000000
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B0044005300200073006500720076006900630065000000004B004400530020007000750062006C006900630020006B00650079000000
                         Label: KDS service
-                        Context: A84FC6BA90E87C91109083E7B0F85996690100000F0000001E000000
-                                RootKeyId: 168 79 198 186 144 232 124 145 16 144 131 231 176 248 89 150
-                                L0: 361
-                                L1: 15
-                                L2: 30
-BCryptKeyDerivation -> Res: 0x00000000, Derived: 3B369385E623113F0B850E9FB378E164123C3845D523EB1C2ACD0325D1F497D28EBA41F642E7AAC35AAD0AF6CEC62B4192C06F9B8A9DFAF42F107FA5CDAAF11D, A: 0x2DB52F69390
+                        Context: 4B004400530020007000750062006C006900630020006B00650079000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: E4AB33925FAB1FF09AB43FDD4B83F1E449F95EE93ECF92C48AE404482CE755AA
+        """
 
-BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE6A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69390, SecretLength: 64, Flags: 0x00000000) -> Secret: 3B369385E623113F0B850E9FB378E164123C3845D523EB1C2ACD0325D1F497D28EBA41F642E7AAC35AAD0AF6CEC62B4192C06F9B8A9DFAF42F107FA5CDAAF11D
-BCryptGenerateSymmetricKey -> Res: 0x00000000
-
-BCryptKeyDerivation(Key: 0x2DB52AFBBC0, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69390, DerivedKeyLength: 64, OutKeyLength: 0xB97DAFE694, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
-                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000A84FC6BA90E87C91109083E7B0F85996690100000F0000001D000000
-                        Label: KDS service
-                        Context: A84FC6BA90E87C91109083E7B0F85996690100000F0000001D000000
-                                RootKeyId: 168 79 198 186 144 232 124 145 16 144 131 231 176 248 89 150
-                                L0: 361
-                                L1: 15
-                                L2: 29
-BCryptKeyDerivation -> Res: 0x00000000, Derived: 98DF72B98DBA8661B4AFAE0ABA605015114B8A94BCF0843A1FFAF71DEEE6F49CAEFA570D4CF75F1A0F5676E31603CA8B783EBB839BAD8C344EDFDEF7C6ACE974, A: 0x2DB52F69390
-
-BCryptGenerateSymmetricKey(Algorithm: 0x29ABCFE4AD0, Key: 0xB97DAFE780, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2DB52F69190, SecretLength: 64, Flags: 0x00000000)
-    Secret: 98DF72B98DBA8661B4AFAE0ABA605015114B8A94BCF0843A1FFAF71DEEE6F49CAEFA570D4CF75F1A0F5676E31603CA8B783EBB839BAD8C344EDFDEF7C6ACE974
-BCryptGenerateSymmetricKey -> Res: 0x00000000
-
-BCryptKeyDerivation(Key: 0x2DB52AFAE00, ParameterList: 0x29ABCFFB5A0, DerivedKey: 0x2DB52F69190, DerivedKeyLength: 32, OutKeyLength: 0xB97DAFE774, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
-                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B00440053002000730065007200760069006300650000000016B3FA1BFC1066B30B63B29A2D29F31D82FB5AE3CC05F86ECB67EFAC69F2CE55
-                        Label: KDS service
-                        Context: 16B3FA1BFC1066B30B63B29A2D29F31D82FB5AE3CC05F86ECB67EFAC69F2CE55
-BCryptKeyDerivation -> Res: 0x00000000, Derived: FBD5A5143F23822E3F8B7A195F7216E554BEE383A645241BBCFC155EEBF622D3, A: 0x2DB52F69190
-    """
-
-    expected_l2_key = base64.b16decode(
-        "98DF72B98DBA8661B4AFAE0ABA605015114B8A94BCF0843A1FFAF71DEEE6F49CAEFA570D4CF75F1A0F5676E31603CA8B783EBB839BAD8C344EDFDEF7C6ACE974"
-    )
-    # FIXME: My L2 seed key calculation is wrong. The above result is what I
-    # sniffed from Windows when tracing the BCrypt functions.
-    l2_key = expected_l2_key
-    assert (
-        l2_key == expected_l2_key
-    ), f"L2 Key Mismatch\n{base64.b16encode(l2_key).decode()}\n{base64.b16encode(expected_l2_key).decode()}"
-
-    kek = kdf(
-        hash_algo,
-        l2_key,
-        label,
-        password_id.unknown,
-        32,
-    )
-
-    # This is the expected KEK for this
-    expected_kek = base64.b16decode("FBD5A5143F23822E3F8B7A195F7216E554BEE383A645241BBCFC155EEBF622D3")
-    assert (
-        kek == expected_kek
-    ), f"KEK Mismatch\n{base64.b16encode(kek).decode()}\n{base64.b16encode(expected_kek).decode()}"
+    else:
+        kek = kdf(
+            hash_algo,
+            l2_key,
+            KDS_SERVICE_LABEL,
+            password_id.unknown,
+            32,
+        )
 
     # With the kek we can unwrap the encrypted cek in the LAPS payload.
     assert kek_info.key_encryption_algorithm.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
     assert not kek_info.key_encryption_algorithm.parameters
     cek = keywrap.aes_key_unwrap(kek, kek_info.encrypted_key)
-
-    # This is the expected CEK for this
-    expected_cek = base64.b16decode("87AF93EB25B37D7FA2E73E64CA337F2C152E5F14BE83A8A215797321EFDCECD2")
-    assert (
-        cek == expected_cek
-    ), f"CEK Mismatch\n{base64.b16encode(cek).decode()}\n{base64.b16encode(expected_cek).decode()}"
 
     # With the cek we can decrypt the encrypted content in the LAPS payload.
     password = aes256gcm_decrypt(enc_content.algorithm, cek, enc_content.content)
@@ -1518,32 +1648,29 @@ BCryptKeyDerivation -> Res: 0x00000000, Derived: FBD5A5143F23822E3F8B7A195F7216E
 
 
 def get_dh_pub(
-    field_order: bytes,
-    generator: bytes,
+    field_order: int,
+    generator: int,
     private: bytes,
 ) -> bytes:
     # The static public key y is computed from the static private key x by using
     # the following formula
     # y = g**x mod p
 
-    p_int = int.from_bytes(field_order, byteorder="big")
-    g_int = int.from_bytes(generator, byteorder="big")
     x_int = int.from_bytes(private, byteorder="big")
 
-    public_int = pow(g_int, x_int, p_int)
+    public_int = pow(generator, x_int, field_order)
     return public_int.to_bytes((public_int.bit_length() + 7) // 8, byteorder="big")
 
 
 def get_dh_shared_secret(
-    field_order: bytes,
+    field_order: int,
     private: bytes,
     public: bytes,
 ) -> bytes:
-    p_int = int.from_bytes(field_order, byteorder="big")
     x_int = int.from_bytes(private, byteorder="big")
     y_int = int.from_bytes(public, byteorder="big")
 
-    secret = pow(y_int, x_int, p_int)
+    secret = pow(y_int, x_int, field_order)
     return secret.to_bytes((secret.bit_length() + 7) // 8, byteorder="big")
 
 
@@ -1552,11 +1679,17 @@ def main() -> None:
     server = "CN=SERVER2022,OU=Servers,DC=domain,DC=test"
     sign_header = False
 
+    root_key = RootKey(
+        data=base64.b16decode(
+            "dc24ff6db13170188ec9ffb511fa41a6eb51d049fe8cfe27d683d51ed5a10faf643f672ee6ed8f9f5e1118727b3aa9384ff943ff5b04f310530b083c3437996e".upper()
+        ),
+    )
+
     # Delete the key under C:\Users\vagrant-domain\AppData\Local\Microsoft\Crypto\KdsKey\62dfbd45d9ce7632efd1f252eedb7a94b806849138424140b12517aa45eb1f47\PrivateKey\361-bac64fa8-e890-917c-1090-83e7b0f85996
     # to test out the RPC traffic. Will need to figure out how this format is created.
     # GetSIDKeyFileName in KdsCli.dll
 
-    # Manual call to NCryptProtectSecret with b"\x01" - PowerShell
+    # Manual call to NCryptProtectSecret with b"\x00" - PowerShell
     """
     $ncrypt = New-CtypesLib ncrypt.dll
 
@@ -1605,290 +1738,11 @@ def main() -> None:
         dc,
         laps_blob.blob,
         rpc_sign_header=sign_header,
+        # root_key=root_key,
     )
     print(f"LAPS Password: {plaintext.decode('utf-16-le')}")
+
     print(f"Plaintext hex: {base64.b16encode(plaintext).decode()}")
-
-
-"""
-Here is what I'm currently up to.
-
-I can use LDAP to query the LDAP attribute 'msLAPS-EncryptedPassword' on the
-compute object in question. The value of this attribute is a blob in the form
-of:
-
-    update_timestamp_upper: 4 bytes
-    update_timestamp_lower: 4 bytes
-    blob_length: 4 bytes
-    flags: 4 bytes
-    blob: variable (blob_length)
-
-It is simple to unpack this and so far I've found that a blob never contains
-any flags (always 0) and the blob itself is a PKCS 7 ContentInto structure with
-some bytes added onto the end. The ContentInfo structure has a content type of
-'1.2.840.113549.1.7.3' which represents the PKCS 7 envelopedData structure
-defined in RFC 5652 6.1. EnvelopedData Type
-https://www.rfc-editor.org/rfc/rfc5652#section-6.1
-
-      EnvelopedData ::= SEQUENCE {
-        version CMSVersion,
-        originatorInfo [0] IMPLICIT OriginatorInfo OPTIONAL,
-        recipientInfos RecipientInfos,
-        encryptedContentInfo EncryptedContentInfo,
-        unprotectedAttrs [1] IMPLICIT UnprotectedAttributes OPTIONAL }
-
-In this case the version of the EnvelopedData is set to 2 and it contains a
-single recipientInfo and an encryptedContentInfo. The encryptedContentInfo is
-defined in the same RFC as EncryptedContentInfo with the structure
-
-      EncryptedContentInfo ::= SEQUENCE {
-        contentType ContentType,
-        contentEncryptionAlgorithm ContentEncryptionAlgorithmIdentifier,
-        encryptedContent [0] IMPLICIT EncryptedContent OPTIONAL }
-
-Note: The ContentEncryptionAlgorithmIdentifier is just the AlgorithmIdentifier
-defined in another RFC as.
-
-    AlgorithmIdentifier ::= SEQUENCE {
-        algorithm       OBJECT IDENTIFIER,
-        parameters      ANY DEFINED BY algorithm OPTIONAL
-    }
-
-The encryptedContent tag is not actually set for LAPS, the remaining data in
-LAPS blob seem to substitute this value. I don't know why it isn't included in
-the EncryptedContentInfo structure like NCryptProtectSecret usually does but
-it isn't.
-
-The recipientInfos contains a single entry which is a KEKRecipientInfo type
-which is defined in RFC 5652 6.2.3. KEKRecipientInfoType as
-
-      KEKRecipientInfo ::= SEQUENCE {
-        version CMSVersion,  -- always set to 4
-        kekid KEKIdentifier,
-        keyEncryptionAlgorithm KeyEncryptionAlgorithmIdentifier,
-        encryptedKey EncryptedKey }
-
-      KEKIdentifier ::= SEQUENCE {
-        keyIdentifier OCTET STRING,
-        date GeneralizedTime OPTIONAL,
-        other OtherKeyAttribute OPTIONAL }
-
-When unpacking the blob these are the values I get:
-
-    EncryptedContentInfo:
-        contentType:
-        contentEncryptionAlgorithm:
-            algorithm: 2.16.840.1.101.3.4.1.46  # AES256-GCM
-            # A nested ASN.1 value containing the nonce and icvlen
-            parameters: ...
-        # Not actually in the structure but after the PKCS 7 ContentInfo
-        # structure. Just mentioned here for posterity.
-        encryptedContent: ...
-
-    # Contains only 1 recipientinfo - KEKRecipientInfo
-    RecipientInfos:
-        kekid:
-            # This contains the password root key id and L* values
-            keyIdentifier: ...
-            other:
-                keyattrId: 1.3.6.1.4.1.311.74.1
-                # This contains an undocumented ASN.1 value
-                keyattr: ...
-        keyEncryptionAlgorithm:
-            algorithm: 2.16.840.1.101.3.4.1.45  # AES256 wrap
-            parameters: ''  # No parameters
-
-        # I believe this to be the encrypted CEK (encrypted by the KEK)
-        encryptedKey: ...
-
-The keyIdentifier is an undocumented structure in the form of:
-
-    version: 4 bytes (always 1)
-    magic: 0x4B 0x44 0x53 0x4B
-    flags: 4 bytes (typically 2)
-    l0_index: 4 bytes
-    l1_index: 4 bytes
-    l2_index: 4 bytes
-    root_key_identifier: 16 bytes
-    unknown_length: 4 bytes
-    domain_length: 4 bytes
-    forest_length: 4 bytes
-    unknown: variable (unknown_length)
-    domain: variable (domain_length)
-    forest: variable (forest_length)
-
-If the flags has bit 1 set then the unknown value represents the public key of
-the DH pair. If it's not set then it's a 32 byte value that I have no idea of.
-I think this is important but I don't understand why I typically only get the
-32 byte value but I definitely got the DH public key once before.
-
-The kekid.other value contains an undocumented ASN.1 value that is simply 2
-UTF-8 string 'SID' and the sid that protected the blob (what LAPS is registered
-with).
-
-So with all this info I have:
-    * The SID that protects the resource
-    * The group key (keyidentifier) identifier
-        * L0 id
-        * L1 id
-        * L2 id
-        * Root Key Identifier
-        * The domain/forest name to query
-        * Maybe the public key (typically not though)
-    * The encrypted CEK (encryptedKey)
-    * The encrypted CEK encryption algorithm - AES256 wrap
-    * The encrypted LAPS content
-    * The encrypted LAPS content encryption algorithm AES256-GCM with a nonce
-
-With this info I can call the MS-GKDI GetKey https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/4cac87a3-521e-4918-a272-240f8fabed39
-with the details in the group key identifier and the SID wrapped in a security
-descriptor. Note the security descriptor has the owner and group of S-1-5-18
-and 2 ACES in the DACL. One ACE has a mask of 3 containing the SID in the LAPS
-payload, another ACE has S-1-1-0 with a mask of 2. This is the behaviour seen
-on the wire so I just replicated it.
-
-This call must be done with RCP over TCP/IP with privary applied to the
-connection. The EPM on port 135 can be first queried to see what ports the
-GetKey interface is registered on.
-
-The returned value is a blob in the form of MS-GKDI Group key Envelope
-https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/192c061c-e740-4aa0-ab1d-6954fb3e58f7
-Relevant values contained in this structure are:
-
-    L0 index: Typically the same as the L0 id requested
-    L1 index: Typically the same as the L1 id requested
-    L2 index: Maybe the same or higher than the L2 id requested
-    L1 key: The L1 seed key (64 bytes)
-    L2 key: The L2 seed key (64 bytes)
-    KDF Algorithm: SP800_108_CTR_HMAC
-    KDF Parameters: SHA512
-    Secret Algorithm: DH
-    Secret Parameters:  The p and g integers as big endian bytes
-    Private Key Length: 512  # In bits
-    Public Key Length: 2048  # In bits
-
-Depending on when LAPS password was set the L2 index returned could be the same
-or a higher value. Strictly speaking L1 could also differ but I haven't been
-dealing with timeframes for that to ever change. Using MS-GKDI Generating a
-Group Key https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/5d373568-dd68-499b-bd06-a3ce16ca7117
-I can work backwards to derive the L2 seed key for the L0, L1, L2 identifier
-stored in the keyidentifier based on the values returned from GetKey. The docs
-state the following algorithm is used to derive the L2 seed key
-
-    KDF(HashAlg, KI, Label, Context, L) — denotes an execution of the [SP800-108] KDF in counter mode ([SP800-108] section 5.1) by using the Hash Message Authentication Code (HMAC)
-    Key(SD, RK, L0, L1, n) = KDF(HashAlg, Key(SD, RK, L0, L1, n+1), "KDS service", RKID || L0 || L1|| n, 512)
-
-Essentially the L2 seed key of (1, 2, 3) is equal to
-
-    KDF(
-        SHA512,
-        L2(RK, 1, 2, 4),
-        "KDS service",
-        RKID | 1 | 2 | 3,
-        512
-    )
-
-So if the L2 index matches what we requested we don't need to do anything but
-if it does not we can continue to work backwards and derive the key for the
-previous L2 index until we reach the one we need as specified in the
-key identifier.
-
-One thing to note is that SP800-108 in Python is done with KBKDFHMAC
-https://cryptography.io/en/latest/hazmat/primitives/key-derivation-functions/#cryptography.hazmat.primitives.kdf.kbkdf.KBKDFHMAC
-This class takes in the inputs documented by Microsoft but it also requires a
-value for rlen and llen. I need to figure out what this should actually be as
-MS-GKDI don't seem to mention it.
-
-In the same section of MS-GKDI we can see the algorithm for generating the DH
-private key is with
-
-    PrivKey(SD, RK, L0, L1, L2) = KDF(HashAlg, Key(SD, RK, L0, L1, L2), "KDS service", RK.msKds-SecretAgreement-AlgorithmID, RK.msKds-PrivateKey-Length)
-
-So we can do the following to derive the DH private "key":
-
-    KDF(
-        SHA512,
-        L2(RK, 1, 2, 3),
-        "KDS service",
-        "DH",
-        512
-    )
-
-It also states the public key can be derived from this using the NIST SP800-56A
-specs 5.6.1.1. As it's a DH key and we know the p, g, and private key (x) values
-this is simply done with g**x mod p.
-
-Now this is where I'm stuck. Based on the docs for DPAPI-NG
-https://learn.microsoft.com/en-us/windows/win32/seccng/protected-data-format
-it somewhat states the CEK is the encryptedKey inside the recipient info is
-encrypted with the KEK. It seems like the KEK is derived by doing AES256 unwrap
-on some value but nothing I've tried results in a successful unwrap. At a guess
-I need to derive the shared DH secret and potentially use that for the AES256
-unwrap but this brings up the questions:
-
-* How do I get the DH secret when I don't know the other parties public key (Y)
-    * The DH formula is meant to be Y ** x mod p
-    * I know p, g, x (my private key), and X (my public key) but not y or Y
-    * Randomly I've seen the password identifier in the kekid keyIdentifier
-        field but that was only once
-    * Is the random 32 byte value in the kekid keyIdentifier somewhat related
-        to this?
-    * Once I do get this secret, do I need to hash it to get the 32 byte length
-        expected by AES256 key unwrap
-
-Assuming I figure out how to get the decrypted CEK with the above I should then
-be able to use that as the key in the AES256-GCM decryption process on the
-LAPS encrypted content to get the encrypted payload.
-"""
-
-# Another example of the expanded msLAPS-EncryptedPassword value with some
-# hints on the values.
-# Recipients:
-# - Choice: 2
-#   Type: KEKRecipientInfo
-#   Version: 4
-#   KekId:
-#     # Meant to be the DPAPI blob KEK (Key Encryption Key)?
-#     KeyIdentifier: 010000004B44534B02000000690100000F0000000E000000A84FC6BA90E87C91109083E7B0F85996200000001800000018000000680F80AF80FC2EC0A3D5DCC061A75372DB75ED0E2FC286C29738FCD19A83A41D64006F006D00610069006E002E007400650073007400000064006F006D00610069006E002E0074006500730074000000
-#       # version: 1
-#       # is_public_key: 02000000
-#       # l0_index: 361
-#       # l1_index: 15
-#       # l2_index: 14
-#       # root_key_identifier: bac64fa8-e890-917c-1090-83e7b0f85996
-#       # public_key: 680F80AF80FC2EC0A3D5DCC061A75372DB75ED0E2FC286C29738FCD19A83A41D
-#       # domain_name: domain.test
-#       # forest_name: domain.test
-#     Date:
-#     OtherId: 1.3.6.1.4.1.311.74.1
-#     OtherValue: 3046060A2B0601040182374A01013038303630340C035349440C2D532D312D352D32312D343135313830383739372D333433303536313039322D323834333436343538382D353132
-#       # OID Mappings
-#       #   1   - SID
-#       #   8   - Local
-#       #   12  - KeyFile
-#       #   ?   - SDDL
-#       #   ?   - WEBCREDENTIALS
-#       #   ?   - LOCKEDCREDENTIALS
-#       #   ?   - CERTIFICATE
-#       # ContentInfo SEQUENCE (2 elem)
-#       #   contentType ContentType OBJECT IDENTIFIER 1.3.6.1.4.1.311.74.1.1
-#       #   content [0] SEQUENCE (1 elem)
-#       #     ANY SEQUENCE (1 elem)
-#       #       SEQUENCE (2 elem)
-#       #         UTF8String SID
-#       #         UTF8String S-1-5-21-4151808797-3430561092-2843464588-512
-#   Algorithm:
-#     Id: 2.16.840.1.101.3.4.1.45  # AES256 Wrap
-#     Parameters: ''
-#   EncryptedKey: 0A279226835B0A2C52D8EED295B686CAB15F98F15FEF7DAD9C32A196C0505568FEAF0B35103705DE
-# EncryptedContentInfo:
-#   ContentType: 1.2.840.113549.1.7.1  # data (PKCS #7)
-#   Algorithm:
-#     Id: 2.16.840.1.101.3.4.1.46  # AES256-GCM
-#     Parameters: 3011040C4E99F95209A27CA07FF4B850020110
-#       # SEQUENCE (2 elem)
-#       #   OCTET STRING (12 byte) 4E99F95209A27CA07FF4B850 - aes-nonce
-#       #   INTEGER 16                                      - aes-ICVlen
 
 
 if __name__ == "__main__":
