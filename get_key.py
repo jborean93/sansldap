@@ -159,7 +159,7 @@ class FFCDHKey:
     key_length: int
     field_order: int
     generator: int
-    public_key: bytes
+    public_key: int
 
     @classmethod
     def unpack(
@@ -186,7 +186,7 @@ class FFCDHKey:
             key_length=key_length,
             field_order=int.from_bytes(field_order, byteorder="big"),
             generator=int.from_bytes(generator, byteorder="big"),
-            public_key=public_key,
+            public_key=int.from_bytes(public_key, byteorder="big"),
         )
 
 
@@ -1487,12 +1487,6 @@ def ncrypt_unprotect_secret(
     l2_key = compute_l2_key(hash_algo, password_id, rk)
 
     if password_id.is_public_key:
-        # MS-GKDI - 3.1.4.1.2 Generating a Group key
-        # To derive a group public key with a group key identifier (L0, L1, L2),
-        # the server MUST proceed as follows:
-        # First, the server MUST validate the root key configuration attributes
-        # related to public keys
-
         # DH
         # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH",
         # RK.msKds-SecretAgreement-Param MUST be in the format specified in section
@@ -1513,6 +1507,7 @@ def ncrypt_unprotect_secret(
         #   RK.msKds-SecretAgreement-AlgorithmID,
         #   RK.msKds-PrivateKey-Length
         # )
+        public_key_info = FFCDHKey.unpack(password_id.unknown)
         private_key = kdf(
             hash_algo,
             l2_key,
@@ -1521,121 +1516,37 @@ def ncrypt_unprotect_secret(
             math.ceil(rk.private_key_length / 8),
         )
 
-        expected_priv_key = base64.b16decode(
-            "6DA51A773F9E205700991BCAF3C23BF03257EDBED5EEBC14C7961C7B0C9C1D2C4BBE9607F61BBB59AB83E466CEF4FF60527407694A1306DCB0776788A1FB6429"
+        # Now we have derived our private key and have the peers public key, we
+        # can derive the shared secret based on the DH formula.
+        # s = y**x mod p
+        shared_secret_int = pow(
+            public_key_info.public_key,
+            int.from_bytes(private_key, byteorder="big"),
+            public_key_info.field_order,
         )
-        assert (
-            private_key == expected_priv_key
-        ), f"Private key mismatch\n{base64.b16encode(private_key).decode()}\n{base64.b16encode(expected_priv_key).decode()}"
+        shared_secret = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, byteorder="big")
 
-        # 3. Lastly, the server MUST compute the group public key
-        # PubKey(SD, RK, L0, L1, L2) as follows:
-
-        # Test case
-        # P = b"\x0D"  # 13
-        # G = b"\x06"
-        # a = b"\x05"
-        # b = b"\x04"
-        # A = b"\x02"
-        # B = b"\x09"
-        # s = b"\x03"
-
-        # actual = get_dh_pub(P, G, a)
-        # assert actual == A
-
-        # actual = get_dh_pub(P, G, b)
-        # assert actual == B
-
-        # actual = get_dh_shared_secret(P, a, B)
-        # assert actual == s
-
-        # actual = get_dh_shared_secret(P, b, A)
-        # assert actual == s
-
-        # DH
-        # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH", the server MUST
-        # compute PubKey(SD, RK, L0, L1, L2) by using the method specified in
-        # [SP800-56A] section 5.6.1.1, with the group parameters specified in
-        # RK.msKds-SecretAgreement-Param, and with PrivKey(SD, RK, L0, L1, L2) as
-        # the private key
-        # public_key = get_dh_pub(dh_parameters.field_order, dh_parameters.generator, private_key)
-
-        # TODO: Support ECHD keys
-
-        # With the private and public key we can derive the shared secret
-        # This isn't right we only have our private and public key. We need the
-        # peer's public key for this.
-        public_key = FFCDHKey.unpack(password_id.unknown)
-        shared_secret = get_dh_shared_secret(dh_parameters.field_order, private_key, public_key.public_key)
-
-        kds_public_key = "KDS public key\0".encode("utf-16-le")
-        otherinfo = kdf_parameters.hash_name.encode("utf-16-le") + kds_public_key + KDS_SERVICE_LABEL
-        # otherinfo = kds_public_key + KDS_SERVICE_LABEL
-        concat_agreement = ConcatKDFHash(hash_algo, length=32, otherinfo=otherinfo).derive(shared_secret)
-
-        expected_concat_agreement = base64.b16decode("EF2B290FDFC8F4D4E2BD55CF1B6F565254F73DFAE3CDA2715485220B128F9792")
-        assert (
-            concat_agreement == expected_concat_agreement
-        ), f"Concat agreement mismatch\n{base64.b16encode(concat_agreement).decode()}\n{base64.b16encode(expected_concat_agreement).decode()}"
-
-        kek = kdf(
-            hash_algo,
-            concat_agreement,
-            KDS_SERVICE_LABEL,
-            kds_public_key,
-            32,
-        )
-
-        expected_kek = base64.b16decode("E4AB33925FAB1FF09AB43FDD4B83F1E449F95EE93ECF92C48AE404482CE755AA")
-        assert (
-            kek == expected_kek
-        ), f"KEK mismatch\n{base64.b16encode(kek).decode()}\n{base64.b16encode(expected_kek).decode()}"
-
-        """
-# l2_key
-BCryptGenerateSymmetricKey(Algorithm: 0x1C8A1CC0DF0, Key: 0x38230BE5B0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x2093AFB3A10, SecretLength: 64, Flags: 0x00000000)
-        Secret: 44900E2CC9BC8E702D594AA63B59F04D365CAFC1590FDEAD37EDA62BB083F49B05DEA0A82BD65C863173E9B3638CB2002F8D21520D2D3C55659022A9EAFB06A1
-BCryptGenerateSymmetricKey -> Res: 0x00000000
-
-BCryptKeyDerivation(Key: 0x1C8A26E20C0, ParameterList: 0x2093ADFD3D0, DerivedKey: 0x2093AFB3A10, DerivedKeyLength: 64, OutKeyLength: 0x38230BE5A4, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
-                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000440048000000
-                        Label: KDS service
-                        Context: 440048000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: 6DA51A773F9E205700991BCAF3C23BF03257EDBED5EEBC14C7961C7B0C9C1D2C4BBE9607F61BBB59AB83E466CEF4FF60527407694A1306DCB0776788A1FB6429
-
-BCryptDeriveKey(SharedSecret: 0x2093AC41E20, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0x38230BE680, DerivedKey: 0x00000000, DerivedKeyLength: 0, OutKeyLength: 0x38230BE670, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
-                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
-                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
-                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: 0000000000000000000000000000000000000000000000000000000000000000
-
-BCryptDeriveKey(SharedSecret: 0x2093AC41E20, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0x38230BE680, DerivedKey: 0x2093AF51340, DerivedKeyLength: 32, OutKeyLength: 0x38230BE670, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
-                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
-                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
-                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: EF2B290FDFC8F4D4E2BD55CF1B6F565254F73DFAE3CDA2715485220B128F9792
-
-BCryptKeyDerivation(Key: 0x1C8A26E15C0, ParameterList: 0x2093AFC6D30, DerivedKey: 0x2093AC7EEA0, DerivedKeyLength: 32, OutKeyLength: 0x38230BE5A4, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
-                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA512
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B0044005300200073006500720076006900630065000000004B004400530020007000750062006C006900630020006B00650079000000
-                        Label: KDS service
-                        Context: 4B004400530020007000750062006C006900630020006B00650079000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: E4AB33925FAB1FF09AB43FDD4B83F1E449F95EE93ECF92C48AE404482CE755AA
-        """
+        # This part isn't documented but we use the shared share, use the
+        # key derivation algorithm SP 800-56A to derive the kek secret input
+        # value. On Windows this uses BCryptDeriveKey which has a hardcoded hash
+        # of SHA256 internally. Our KDF algorithm plus some magic constants
+        # found in the source code are used in the otherinfo input value and
+        # correspond to the BCryptBufferDesc values Win32 uses.
+        kek_context = "KDS public key\0".encode("utf-16-le")
+        otherinfo = kdf_parameters.hash_name.encode("utf-16-le") + b"\x00\x00" + kek_context + KDS_SERVICE_LABEL
+        kek_secret = ConcatKDFHash(hashes.SHA256(), length=32, otherinfo=otherinfo).derive(shared_secret)
 
     else:
-        kek = kdf(
-            hash_algo,
-            l2_key,
-            KDS_SERVICE_LABEL,
-            password_id.unknown,
-            32,
-        )
+        kek_secret = l2_key
+        kek_context = password_id.unknown
+
+    kek = kdf(
+        hash_algo,
+        kek_secret,
+        KDS_SERVICE_LABEL,
+        kek_context,
+        32,
+    )
 
     # With the kek we can unwrap the encrypted cek in the LAPS payload.
     assert kek_info.key_encryption_algorithm.algorithm == "2.16.840.1.101.3.4.1.45"  # AES256-wrap
@@ -1645,33 +1556,6 @@ BCryptKeyDerivation -> Res: 0x00000000, Derived: E4AB33925FAB1FF09AB43FDD4B83F1E
     # With the cek we can decrypt the encrypted content in the LAPS payload.
     password = aes256gcm_decrypt(enc_content.algorithm, cek, enc_content.content)
     return password
-
-
-def get_dh_pub(
-    field_order: int,
-    generator: int,
-    private: bytes,
-) -> bytes:
-    # The static public key y is computed from the static private key x by using
-    # the following formula
-    # y = g**x mod p
-
-    x_int = int.from_bytes(private, byteorder="big")
-
-    public_int = pow(generator, x_int, field_order)
-    return public_int.to_bytes((public_int.bit_length() + 7) // 8, byteorder="big")
-
-
-def get_dh_shared_secret(
-    field_order: int,
-    private: bytes,
-    public: bytes,
-) -> bytes:
-    x_int = int.from_bytes(private, byteorder="big")
-    y_int = int.from_bytes(public, byteorder="big")
-
-    secret = pow(y_int, x_int, field_order)
-    return secret.to_bytes((secret.bit_length() + 7) // 8, byteorder="big")
 
 
 def main() -> None:
