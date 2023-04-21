@@ -1547,42 +1547,6 @@ def ncrypt_unprotect_secret(
 
     l2_key = compute_l2_key(hash_algo, password_id, rk)
 
-    """
-BCryptGenerateSymmetricKey(Algorithm: 0x15A701D27B0, Key: 0xC4B6FE1A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x15A74EEEA50, SecretLength: 64, Flags: 0x00000000)
-        Secret: 82F69F85C79613862029FFF7A8CA9D174BC05905C5B4ED2E5D3651CD33D732E71EBBA5ACC414D4AC7084A55976F3AF6B930F5B1DF8FD6509DCAC4561D82FA0D3
-BCryptGenerateSymmetricKey -> Res: 0x00000000
-
-BCryptKeyDerivation(Key: 0x15A71A8F040, ParameterList: 0x15A71CDCB50, DerivedKey: 0x15A74EEEA50, DerivedKeyLength: 64, OutKeyLength: 0xC4B6FE194, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
-                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA384
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000440048000000
-                        Label: KDS service
-                        Context: 440048000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: 9C982DC73240E82FC5CDA82514BA33D5CD8F1A68C56C610C8B85788AB61CD14F345F5C203C5D8C2EF8708E27FD4AD0BD05B9E8E14205E80C19A290273E1808AC
-
-BCryptDeriveKey(SharedSecret: 0x15A71B64480, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0xC4B6FE270, DerivedKey: 0x00000000, DerivedKeyLength: 0, OutKeyLength: 0xC4B6FE260, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
-                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
-                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
-                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: 0000000000000000000000000000000000000000000000000000000000000000
-
-BCryptDeriveKey(SharedSecret: 0x15A71B64480, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0xC4B6FE270, DerivedKey: 0x15A71B64680, DerivedKeyLength: 32, OutKeyLength: 0xC4B6FE260, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
-                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
-                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
-                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: ADE92BC8049BCF4CD4180DF759E181024601B666FA99F27A34AB65735E75E948
-
-BCryptKeyDerivation(Key: 0x15A71A8FB40, ParameterList: 0x15A71CDD6B0, DerivedKey: 0x15A71B646A0, DerivedKeyLength: 32, OutKeyLength: 0xC4B6FE194, Flags: 0x00000000)
-        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
-                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA384
-                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B0044005300200073006500720076006900630065000000004B004400530020007000750062006C006900630020006B00650079000000
-                        Label: KDS service
-                        Context: 4B004400530020007000750062006C006900630020006B00650079000000
-BCryptKeyDerivation -> Res: 0x00000000, Derived: 63696D7F086438E475BF48C676267735873C7CD3B8CDF4AF37C199CB568678D2
-    """
-
     if password_id.is_public_key:
         # PrivKey(SD, RK, L0, L1, L2) = KDF(
         #   HashAlg,
@@ -1599,7 +1563,6 @@ BCryptKeyDerivation -> Res: 0x00000000, Derived: 63696D7F086438E475BF48C67626773
             math.ceil(rk.private_key_length / 8),
         )
 
-        # TODO: Support ECHD keys
         if rk.secret_algorithm == "DH":
             dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
             assert dh_parameters.key_length == (rk.public_key_length // 8)
@@ -1614,13 +1577,23 @@ BCryptKeyDerivation -> Res: 0x00000000, Derived: 63696D7F086438E475BF48C67626773
             )
             shared_secret = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, byteorder="big")
 
-        elif rk.secret_algorithm in ["ECDH_P256", "ECDH_P384", "ECDH_P512"]:
+        elif rk.secret_algorithm in ["ECDH_P256", "ECDH_P384", "ECDH_P521"]:
             assert not rk.secret_parameters
+
+            curve: ec.EllipticCurve = {
+                "ECDH_P256": ec.SECP256R1(),
+                "ECDH_P384": ec.SECP384R1(),
+                "ECDH_P521": ec.SECP521R1(),
+            }[rk.secret_algorithm]
 
             ecdh_pub_key_info = ECDHKey.unpack(password_id.unknown)
 
-            shared_secret = b""
-            raise NotImplementedError()
+            ecdh_pub_key = ec.EllipticCurvePublicNumbers(ecdh_pub_key_info.x, ecdh_pub_key_info.y, curve).public_key()
+            ecdh_private = ec.derive_private_key(
+                int.from_bytes(private_key, byteorder="big"),
+                curve,
+            )
+            shared_secret = ecdh_private.exchange(ec.ECDH(), ecdh_pub_key)
 
         else:
             raise NotImplementedError(f"Unknown secret algorithm '{rk.secret_algorithm}'")
