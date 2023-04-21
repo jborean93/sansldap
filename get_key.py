@@ -15,7 +15,7 @@ import gssapi
 import gssapi.raw
 import spnego
 from cryptography.hazmat.primitives import hashes, keywrap
-from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.asymmetric import dh, ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash, ConcatKDFHMAC
@@ -233,6 +233,38 @@ class FFCDHParameters:
             key_length=key_length,
             field_order=int.from_bytes(field_order, byteorder="big"),
             generator=int.from_bytes(generator, byteorder="big"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ECDHKey:
+    key_length: int
+    x: int
+    y: int
+
+    @classmethod
+    def unpack(
+        cls,
+        data: t.Union[bytes, bytearray, memoryview],
+    ) -> ECDHKey:
+        view = memoryview(data)
+
+        assert view[:3].tobytes() == b"\x45\x43\x4B"
+        assert view[3] in [49, 51, 53]
+
+        length = struct.unpack("<I", view[4:8])[0]
+
+        x = view[8 : 8 + length].tobytes()
+        assert len(x) == length
+        view = view[8 + length :]
+
+        y = view[:length].tobytes()
+        assert len(y) == length
+
+        return ECDHKey(
+            key_length=length,
+            x=int.from_bytes(x, byteorder="big"),
+            y=int.from_bytes(y, byteorder="big"),
         )
 
 
@@ -791,41 +823,57 @@ def create_request(
 
     sec_trailer: t.Optional[SecTrailer] = None
     if ctx and sign_header:
-        raise NotImplementedError()
+        dummy_iov = gssapi.raw.IOV(
+            gssapi.raw.IOVBufferType.header,
+            b"",
+            std_layout=False,
+        )
+        gssapi.raw.wrap_iov_length(ctx, dummy_iov, confidential=True, qop=None)
+        dummy_header = dummy_iov[0].value or b""
+        dummy_header_length = len(dummy_header)
 
-        # I have no idea what is actually signed. I'm guessing it's the PDU header
-        # with a blanked out fragment length field but this probably needs tweaking.
-        # memoryview(pdu)[8:10] = b"\x00\x00"
+        sec_trailer = SecTrailer(
+            type=9,  # SPNEGO
+            level=6,  # Packet Privacy
+            pad_length=auth_padding,
+            context_id=0,
+            data=dummy_header,
+        )
+        pdu_req = bytearray(
+            create_pdu(
+                packet_type=0,
+                packet_flags=0x03,
+                call_id=1,
+                header_data=bytes(request_data),
+                stub_data=data,
+                sec_trailer=sec_trailer,
+            )
+        )
 
-        # iov_buffers = gssapi.raw.IOV(
-        #     gssapi.raw.IOVBufferType.header,
-        #     (gssapi.raw.IOVBufferType.sign_only, pdu),
-        #     data,
-        #     std_layout=False,
-        # )
-        # gssapi.raw.wrap_iov(
-        #     ctx,
-        #     message=iov_buffers,
-        #     confidential=True,
-        #     qop=None,
-        # )
+        sec_trailer_data = pdu_req[-(dummy_header_length + 8) : -dummy_header_length]
+        iov_buffers = gssapi.raw.IOV(
+            # The PDU header up to the stub data
+            (gssapi.raw.IOVBufferType.sign_only, pdu_req[:24]),
+            # The stub data.
+            data,
+            # The security trailer portion without the auth data
+            (gssapi.raw.IOVBufferType.sign_only, sec_trailer_data),
+            # Will store the generated header here.
+            gssapi.raw.IOVBufferType.header,
+            std_layout=False,
+        )
+        gssapi.raw.wrap_iov(
+            ctx,
+            message=iov_buffers,
+            confidential=True,
+            qop=None,
+        )
 
-        # sec_trailer = SecTrailer(
-        #     type=9,  # SPNEGO
-        #     level=6,  # Packet Privacy
-        #     pad_length=auth_padding,
-        #     context_id=0,
-        #     data=iov_buffers[0].value or b"",
-        # )
+        data_view = memoryview(pdu_req)
+        data_view[24 : 24 + len(data)] = iov_buffers[1].value or b""
+        data_view[-76:] = bytes(iov_buffers[3].value or b"")
 
-        # return create_pdu(
-        #     packet_type=0,
-        #     packet_flags=0x03,
-        #     call_id=1,
-        #     header_data=bytes(request_data),
-        #     stub_data=iov_buffers[2].value,
-        #     sec_trailer=sec_trailer,
-        # )
+        return bytes(pdu_req)
 
     elif ctx:
         iov_buffers = gssapi.raw.IOV(
@@ -932,7 +980,20 @@ def parse_response(
         padding = 0
 
     if ctx and sign_header:
-        raise NotImplementedError()
+        iov_buffers = gssapi.raw.IOV(
+            (gssapi.raw.IOVBufferType.sign_only, data[:24]),
+            stub_data.tobytes(),
+            (gssapi.raw.IOVBufferType.sign_only, auth_data[:8].tobytes()),
+            (gssapi.raw.IOVBufferType.header, False, auth_data[8:].tobytes()),
+            std_layout=False,
+        )
+        gssapi.raw.unwrap_iov(
+            ctx,
+            message=iov_buffers,
+        )
+
+        decrypted_stub = iov_buffers[1].value or b""
+        return decrypted_stub[: len(decrypted_stub) - padding]
 
     elif ctx:
         iov_buffers = gssapi.raw.IOV(
@@ -1486,20 +1547,43 @@ def ncrypt_unprotect_secret(
 
     l2_key = compute_l2_key(hash_algo, password_id, rk)
 
+    """
+BCryptGenerateSymmetricKey(Algorithm: 0x15A701D27B0, Key: 0xC4B6FE1A0, KeyObject: 0x00000000, KeyObjectLength: 0x00000000, Secret: 0x15A74EEEA50, SecretLength: 64, Flags: 0x00000000)
+        Secret: 82F69F85C79613862029FFF7A8CA9D174BC05905C5B4ED2E5D3651CD33D732E71EBBA5ACC414D4AC7084A55976F3AF6B930F5B1DF8FD6509DCAC4561D82FA0D3
+BCryptGenerateSymmetricKey -> Res: 0x00000000
+
+BCryptKeyDerivation(Key: 0x15A71A8F040, ParameterList: 0x15A71CDCB50, DerivedKey: 0x15A74EEEA50, DerivedKeyLength: 64, OutKeyLength: 0xC4B6FE194, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
+                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA384
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B004400530020007300650072007600690063006500000000440048000000
+                        Label: KDS service
+                        Context: 440048000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: 9C982DC73240E82FC5CDA82514BA33D5CD8F1A68C56C610C8B85788AB61CD14F345F5C203C5D8C2EF8708E27FD4AD0BD05B9E8E14205E80C19A290273E1808AC
+
+BCryptDeriveKey(SharedSecret: 0x15A71B64480, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0xC4B6FE270, DerivedKey: 0x00000000, DerivedKeyLength: 0, OutKeyLength: 0xC4B6FE260, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
+                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
+                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
+                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: 0000000000000000000000000000000000000000000000000000000000000000
+
+BCryptDeriveKey(SharedSecret: 0x15A71B64480, KdfAlgorithm: 'SP800_56A_CONCAT', ParameterList: 0xC4B6FE270, DerivedKey: 0x15A71B64680, DerivedKeyLength: 32, OutKeyLength: 0xC4B6FE260, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 3)
+                [0] Type: KDF_ALGORITHMID (8), Data: 5300480041003500310032000000
+                [1] Type: KDF_PARTYUINFO (9), Data: 4B004400530020007000750062006C006900630020006B00650079000000
+                [2] Type: KDF_PARTYVINFO (10), Data: 4B0044005300200073006500720076006900630065000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: ADE92BC8049BCF4CD4180DF759E181024601B666FA99F27A34AB65735E75E948
+
+BCryptKeyDerivation(Key: 0x15A71A8FB40, ParameterList: 0x15A71CDD6B0, DerivedKey: 0x15A71B646A0, DerivedKeyLength: 32, OutKeyLength: 0xC4B6FE194, Flags: 0x00000000)
+        BCryptKeyDerivation ParameterList(Version: 0, Buffers: 2)
+                [0] Type: KDF_HASH_ALGORITHM (0), Data: SHA384
+                [1] Type: KDF_GENERIC_PARAMETER (17), Data: 4B0044005300200073006500720076006900630065000000004B004400530020007000750062006C006900630020006B00650079000000
+                        Label: KDS service
+                        Context: 4B004400530020007000750062006C006900630020006B00650079000000
+BCryptKeyDerivation -> Res: 0x00000000, Derived: 63696D7F086438E475BF48C676267735873C7CD3B8CDF4AF37C199CB568678D2
+    """
+
     if password_id.is_public_key:
-        # DH
-        # If RK.msKds-SecretAgreement-AlgorithmID is equal to "DH",
-        # RK.msKds-SecretAgreement-Param MUST be in the format specified in section
-        # 2.2.2, and the Key length field of RK.msKds-SecretAgreement-Param MUST be
-        # equal to RK.msKds-PublicKey-Length
-
-        # TODO: Support ECHD keys
-        assert rk.secret_algorithm == "DH"
-        dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
-        assert dh_parameters.key_length == (rk.public_key_length // 8)
-
-        # 2. Having validated the root key configuration, the server MUST then
-        # compute the group private key in the following manner:
         # PrivKey(SD, RK, L0, L1, L2) = KDF(
         #   HashAlg,
         #   Key(SD, RK, L0, L1, L2),
@@ -1507,7 +1591,6 @@ def ncrypt_unprotect_secret(
         #   RK.msKds-SecretAgreement-AlgorithmID,
         #   RK.msKds-PrivateKey-Length
         # )
-        public_key_info = FFCDHKey.unpack(password_id.unknown)
         private_key = kdf(
             hash_algo,
             l2_key,
@@ -1516,24 +1599,45 @@ def ncrypt_unprotect_secret(
             math.ceil(rk.private_key_length / 8),
         )
 
-        # Now we have derived our private key and have the peers public key, we
-        # can derive the shared secret based on the DH formula.
-        # s = y**x mod p
-        shared_secret_int = pow(
-            public_key_info.public_key,
-            int.from_bytes(private_key, byteorder="big"),
-            public_key_info.field_order,
-        )
-        shared_secret = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, byteorder="big")
+        # TODO: Support ECHD keys
+        if rk.secret_algorithm == "DH":
+            dh_parameters = FFCDHParameters.unpack(rk.secret_parameters)
+            assert dh_parameters.key_length == (rk.public_key_length // 8)
+
+            # We can derive the shared secret based on the DH formula.
+            # s = y**x mod p
+            dh_pub_key = FFCDHKey.unpack(password_id.unknown)
+            shared_secret_int = pow(
+                dh_pub_key.public_key,
+                int.from_bytes(private_key, byteorder="big"),
+                dh_pub_key.field_order,
+            )
+            shared_secret = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, byteorder="big")
+
+        elif rk.secret_algorithm in ["ECDH_P256", "ECDH_P384", "ECDH_P512"]:
+            assert not rk.secret_parameters
+
+            ecdh_pub_key_info = ECDHKey.unpack(password_id.unknown)
+
+            shared_secret = b""
+            raise NotImplementedError()
+
+        else:
+            raise NotImplementedError(f"Unknown secret algorithm '{rk.secret_algorithm}'")
 
         # This part isn't documented but we use the shared share, use the
         # key derivation algorithm SP 800-56A to derive the kek secret input
         # value. On Windows this uses BCryptDeriveKey which has a hardcoded hash
-        # of SHA256 internally. Our KDF algorithm plus some magic constants
-        # found in the source code are used in the otherinfo input value and
-        # correspond to the BCryptBufferDesc values Win32 uses.
+        # of SHA256 internally regardless of the configured KDF algorithm. The
+        # other info is comprised of the following UTF-16-LE encoded NULL
+        # terminated strings:
+        #   KDF_ALGORITHMID - SHA512
+        #   KDF_PARTYUINFO  - KDS public key
+        #   KDF_PARTYVINFO  - KDS service
+        # The Algorithm is always SHA512 regardless of the KDF parameters set
+        # on the key.
         kek_context = "KDS public key\0".encode("utf-16-le")
-        otherinfo = kdf_parameters.hash_name.encode("utf-16-le") + b"\x00\x00" + kek_context + KDS_SERVICE_LABEL
+        otherinfo = "SHA512\0".encode("utf-16-le") + kek_context + KDS_SERVICE_LABEL
         kek_secret = ConcatKDFHash(hashes.SHA256(), length=32, otherinfo=otherinfo).derive(shared_secret)
 
     else:
@@ -1559,9 +1663,13 @@ def ncrypt_unprotect_secret(
 
 
 def main() -> None:
-    dc = "dc01.domain.test"
-    server = "CN=SERVER2022,OU=Servers,DC=domain,DC=test"
-    sign_header = False
+    # dc = "dc01.domain.test"
+    # server = "CN=SERVER2022,OU=Servers,DC=domain,DC=test"
+
+    dc = "dc01.laps.test"
+    server = "CN=APP01,OU=Servers,DC=laps,DC=test"
+
+    sign_header = True
 
     root_key = RootKey(
         data=base64.b16decode(
